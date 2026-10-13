@@ -1,0 +1,16 @@
+# Solo la base de datos PostgreSQL con la extensión pgvector
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: chatpdf_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: "1234"
+      POSTGRES_DB: rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
