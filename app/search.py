@@ -163,20 +163,47 @@ def buscar_similares(pregunta: str, usuario: str, documentos: list[str] | None =
     max_relevancia = max(relevancia.values(), default=1) or 1
     max_rrf = max(rrf.values(), default=1)
 
+    ids_por_vectores = {f[0] for f in por_vectores}
+    ids_por_palabras = {f[0] for f in por_palabras}
     fragmentos = []
     for id_, (documento, pagina, contenido) in candidatos.items():
+        coincidencia = _coincidencia(palabras, contenido)
+        relevancia_texto = relevancia.get(id_, 0) / max_relevancia
         puntaje = (
             (1 - distancias[id_])  # similitud por significado
-            + config.PESO_PALABRAS * _coincidencia(palabras, contenido)
-            + config.PESO_FTS * relevancia.get(id_, 0) / max_relevancia
+            + config.PESO_PALABRAS * coincidencia
+            + config.PESO_FTS * relevancia_texto
             + config.PESO_RRF * rrf[id_] / max_rrf
         )
-        fragmentos.append({"documento": documento, "pagina": pagina, "contenido": contenido,
-                           "distancia": distancias[id_], "puntaje": puntaje})
+        hallado_por = ("significado y palabras" if id_ in ids_por_vectores and id_ in ids_por_palabras
+                       else "significado" if id_ in ids_por_vectores else "palabras")
+        fragmentos.append({"id": id_, "documento": documento, "pagina": pagina, "contenido": contenido,
+                           "distancia": distancias[id_], "similitud": 1 - distancias[id_],
+                           "coincidencia": coincidencia, "relevancia_texto": relevancia_texto,
+                           "hallado_por": hallado_por, "puntaje": puntaje})
     fragmentos.sort(key=lambda f: f["puntaje"], reverse=True)
+    elegidos = fragmentos[:config.TOP_K]
+
+    # Dónde está cada fragmento elegido dentro de su documento ("fragmento 12 de 42") y cuántos
+    # fragmentos había en total entre los documentos donde se buscó
+    if elegidos:
+        with db.conectar() as conn:
+            posiciones = {i: (pos, total) for i, pos, total in conn.execute(
+                """
+                SELECT id, pos, total FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY documento ORDER BY id) AS pos,
+                           COUNT(*) OVER (PARTITION BY documento) AS total
+                    FROM chunks WHERE usuario = %s
+                ) t WHERE id = ANY(%s)
+                """,
+                (usuario, [f["id"] for f in elegidos]))}
+            total_buscado = conn.execute(f"SELECT COUNT(*) FROM chunks WHERE {filtro}", extra).fetchone()[0]
+        for f in elegidos:
+            f["posicion"], f["total_documento"] = posiciones.get(f["id"], (None, None))
+            f["total_buscado"] = total_buscado
     t2 = time.perf_counter()
 
     if tiempos is not None:
         tiempos["embedding_ms"] = round((t1 - t0) * 1000)  # pregunta -> vector (Ollama)
         tiempos["busqueda_db_ms"] = round((t2 - t1) * 1000)  # búsquedas + reordenamiento
-    return fragmentos[:config.TOP_K]
+    return elegidos

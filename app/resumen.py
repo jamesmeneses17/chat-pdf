@@ -6,29 +6,70 @@ from app import config, db
 from app.llm import generar_respuesta, generar_respuesta_stream
 
 
-def _muestra(fragmentos: list[str], limite: int) -> str:
-    """Junta fragmentos hasta ~`limite` caracteres.
+MIN_CARACTERES_POR_PAGINA = 150  # por debajo de esto un fragmento ya no dice casi nada
 
-    Si el documento es largo, toma fragmentos repartidos de principio a fin
-    (así el resultado cubre todo el PDF y no solo las primeras páginas).
+
+def _recortar(texto: str, limite: int) -> str:
+    """Corta el texto en `limite` caracteres sin partir una palabra."""
+    if len(texto) <= limite:
+        return texto
+    return texto[:limite].rsplit(" ", 1)[0] + "…"
+
+
+def muestra_del_documento(usuario: str, nombre: str) -> tuple[str, dict]:
+    """Un fragmento por página, juntos en orden. Devuelve (texto, cobertura).
+
+    De cada página se toma su fragmento más largo (el que más contenido tiene). El texto total
+    cabe en RESUMEN_CHARS: cada página recibe una parte igual del espacio. Si hay tantas páginas
+    que cada una tendría muy poco, se eligen páginas repartidas de principio a fin.
+    `cobertura` dice qué parte del documento se usó, para mostrarlo junto al resultado.
     """
-    if sum(len(f) for f in fragmentos) <= limite:
-        return "\n\n".join(fragmentos)
-    promedio = sum(len(f) for f in fragmentos) / len(fragmentos)
-    cantidad = max(1, int(limite // promedio))
-    paso = len(fragmentos) / cantidad
-    elegidos = [fragmentos[int(i * paso)] for i in range(cantidad)]
-    return "\n\n".join(elegidos)
+    filas = db.obtener_fragmentos_con_pagina(usuario, nombre)
+    if not filas:
+        raise ValueError("Documento no encontrado.")
+    # Los bloques de "respuestas marcadas" son un apoyo para el chat: no van en resúmenes ni glosarios
+    del_texto = [(p, c) for p, c in filas if not c.startswith("RESPUESTAS MARCADAS") and "→" not in c]
+    del_texto = del_texto or filas
+
+    mejor_de_pagina: dict[int, str] = {}
+    for pagina, contenido in del_texto:
+        if len(contenido) > len(mejor_de_pagina.get(pagina, "")):
+            mejor_de_pagina[pagina] = contenido
+    paginas = sorted(mejor_de_pagina)
+
+    maximo = max(1, config.RESUMEN_CHARS // MIN_CARACTERES_POR_PAGINA)
+    elegidas = paginas
+    if len(paginas) > maximo:  # documento muy largo: páginas repartidas
+        elegidas = [paginas[int(i * len(paginas) / maximo)] for i in range(maximo)]
+    presupuesto = config.RESUMEN_CHARS // len(elegidas)
+    partes = [f"[Página {p}] {_recortar(mejor_de_pagina[p], presupuesto)}" for p in elegidas]
+
+    texto_total = sum(len(c) for _, c in del_texto)
+    texto_usado = sum(len(_recortar(mejor_de_pagina[p], presupuesto)) for p in elegidas)
+    cobertura = {
+        "fragmentos_usados": len(elegidas),
+        "fragmentos_total": len(del_texto),
+        "paginas_usadas": elegidas,
+        "paginas_total": len(paginas),
+        "porcentaje": round(100 * texto_usado / max(1, texto_total)),
+    }
+    return "\n\n".join(partes), cobertura
+
+
+def cifras_sin_respaldo(resumen: str, texto_leido: str) -> list[str]:
+    """Cifras que el resumen menciona pero que no están en el texto que el modelo leyó.
+
+    Los modelos pequeños a veces inventan números ("20 preguntas"). No se puede corregir, pero sí avisar.
+    """
+    def cifras(texto: str) -> set[str]:
+        sin_etiquetas = re.sub(r"\[Página \d+\]", " ", texto)  # los números de página no cuentan
+        return {c.strip(".,") for c in re.findall(r"\d[\d.,]*", sin_etiquetas)}
+    return sorted(cifras(resumen) - cifras(texto_leido), key=lambda c: (len(c), c))
 
 
 def _texto_del_documento(usuario: str, nombre: str) -> str:
     """Texto representativo del documento (para el resumen, las preguntas, etc.)."""
-    fragmentos = db.obtener_fragmentos(usuario, nombre)
-    if not fragmentos:
-        raise ValueError("Documento no encontrado.")
-    # Los bloques de "respuestas marcadas" son un apoyo para el chat: no van en resúmenes ni glosarios
-    del_texto = [f for f in fragmentos if not f.startswith("RESPUESTAS MARCADAS") and "→" not in f]
-    return _muestra(del_texto or fragmentos, config.RESUMEN_CHARS)
+    return muestra_del_documento(usuario, nombre)[0]
 
 
 def _armar_prompt(usuario: str, nombre: str) -> str:
@@ -44,7 +85,9 @@ def _armar_prompt(usuario: str, nombre: str) -> str:
         "- NO inventes cifras, porcentajes ni datos que no estén escritos en el texto.\n"
         "- Si es un formulario, describe sus secciones y preguntas; no afirmes cuáles "
         "respuestas se marcaron.\n"
-        "- El texto puede venir de un escaneo (OCR) con errores o símbolos sueltos: ignóralos.\n\n"
+        "- El texto puede venir de un escaneo (OCR) con errores o símbolos sueltos: ignóralos.\n"
+        "- El contexto reúne un fragmento de cada página del documento (marcados [Página N]): "
+        "resume el documento completo, no solo el inicio.\n\n"
         f"CONTEXTO:\n{texto}\n\n"
         "PREGUNTA: Resume el documento."
     )

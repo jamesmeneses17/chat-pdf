@@ -93,6 +93,30 @@ def crear_tablas():
               END IF;
             END $$""")
 
+        # --- Imágenes de los PDFs y su vector de Gemini (para buscar con una frase) ---
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS imagenes (
+                id SERIAL PRIMARY KEY,
+                usuario TEXT NOT NULL,
+                documento TEXT NOT NULL,
+                pagina INTEGER NOT NULL,
+                ancho INTEGER,
+                alto INTEGER,
+                png BYTEA NOT NULL,
+                embedding vector({config.GEMINI_DIM})
+            )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS imagenes_usuario_idx ON imagenes (usuario, documento)")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS imagenes_embedding_idx
+            ON imagenes USING hnsw (embedding vector_cosine_ops)""")
+
+        # --- Qué claves de Gemini están encendidas (las claves en sí solo viven en el .env) ---
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gemini_claves (
+                numero INTEGER PRIMARY KEY,
+                activa BOOLEAN NOT NULL DEFAULT TRUE
+            )""")
+
         # --- Historial de conversaciones ---
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversaciones (
@@ -161,6 +185,7 @@ def borrar_documento(usuario: str, nombre: str) -> int:
         cur = conn.execute("DELETE FROM chunks WHERE usuario = %s AND documento = %s",
                            (usuario, nombre))
         conn.execute("DELETE FROM documentos WHERE usuario = %s AND nombre = %s", (usuario, nombre))
+        conn.execute("DELETE FROM imagenes WHERE usuario = %s AND documento = %s", (usuario, nombre))
         return cur.rowcount
 
 
@@ -216,6 +241,72 @@ def obtener_fragmentos(usuario: str, nombre: str) -> list[str]:
             (usuario, nombre),
         ).fetchall()
     return [f[0] for f in filas]
+
+
+def guardar_imagenes(usuario: str, documento: str, filas: list[tuple]):
+    """Reemplaza las imágenes indexadas del documento. Cada fila: (página, ancho, alto, png, vector)."""
+    with conectar() as conn:
+        with conn.transaction():
+            conn.execute("DELETE FROM imagenes WHERE usuario = %s AND documento = %s", (usuario, documento))
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO imagenes (usuario, documento, pagina, ancho, alto, png, embedding) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    [(usuario, documento, *fila) for fila in filas],
+                )
+
+
+def buscar_imagenes(usuario: str, vector, documentos: list[str] | None, n: int) -> list[dict]:
+    """Las `n` imágenes del usuario más parecidas al vector (distancia coseno)."""
+    filtro, extra = "usuario = %s", [usuario]
+    if documentos:
+        filtro += " AND documento = ANY(%s)"
+        extra.append(documentos)
+    with conectar() as conn:
+        filas = conn.execute(
+            f"SELECT id, documento, pagina, 1 - (embedding <=> %s) AS similitud FROM imagenes "
+            f"WHERE {filtro} ORDER BY embedding <=> %s LIMIT %s",
+            (vector, *extra, vector, n),
+        ).fetchall()
+    return [{"id": i, "documento": d, "pagina": p, "similitud": float(s)} for i, d, p, s in filas]
+
+
+def claves_gemini_activas() -> dict[int, bool]:
+    """{número de clave: encendida}. Las que no están registradas se consideran encendidas."""
+    with conectar() as conn:
+        return {n: a for n, a in conn.execute("SELECT numero, activa FROM gemini_claves").fetchall()}
+
+
+def fijar_clave_gemini(numero: int, activa: bool):
+    with conectar() as conn:
+        conn.execute(
+            "INSERT INTO gemini_claves (numero, activa) VALUES (%s, %s) "
+            "ON CONFLICT (numero) DO UPDATE SET activa = EXCLUDED.activa", (numero, activa))
+
+
+def obtener_imagen(usuario: str, imagen_id: int) -> bytes | None:
+    with conectar() as conn:
+        fila = conn.execute("SELECT png FROM imagenes WHERE id = %s AND usuario = %s",
+                            (imagen_id, usuario)).fetchone()
+    return bytes(fila[0]) if fila else None
+
+
+def contar_imagenes_indexadas(usuario: str, documentos: list[str] | None = None) -> int:
+    filtro, extra = "usuario = %s", [usuario]
+    if documentos:
+        filtro += " AND documento = ANY(%s)"
+        extra.append(documentos)
+    with conectar() as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM imagenes WHERE {filtro}", extra).fetchone()[0]
+
+
+def obtener_fragmentos_con_pagina(usuario: str, nombre: str) -> list[tuple[int, str]]:
+    """(página, texto) de cada fragmento de un documento, en el orden del PDF."""
+    with conectar() as conn:
+        return conn.execute(
+            "SELECT pagina, contenido FROM chunks WHERE usuario = %s AND documento = %s ORDER BY id",
+            (usuario, nombre),
+        ).fetchall()
 
 
 # ------------------------------------------------------------ conversaciones

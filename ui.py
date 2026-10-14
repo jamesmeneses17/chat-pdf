@@ -38,7 +38,7 @@ if st.session_state.get("usuario_activo") != usuario_actual():
             del st.session_state[clave]
     for clave in ("doc_actual", "pregunta_pendiente", "resaltar", "resaltar_pendiente"):
         st.session_state.pop(clave, None)
-    st.session_state.update(mensajes=[], conv_id=None, pendientes=[], procesados=set(),
+    st.session_state.update(mensajes=[], conv_id=None, pendientes=[], procesados=set(), miniaturas={},
                             usuario_activo=usuario_actual())
 
 # Un resaltado pedido en la ejecución anterior se aplica ahora, antes de dibujar los widgets
@@ -224,10 +224,10 @@ def visor_pdf(nombre: str, pdf: bytes, giros: dict, resaltado: dict | None = Non
     with st.container(height=ALTURA):  # caja con scroll para recorrer todo el PDF
         if resaltado:
             c1, c2 = st.columns([6, 1], vertical_alignment="center")
-            c1.markdown(f"📍 **Fuente de la respuesta — pág. {resaltado['pagina']}**")
+            c1.markdown(f"📍 **{resaltado['titulo']} — pág. {resaltado['pagina']}**")
             c2.button("✖", key="quitar_resaltado", on_click=quitar_resaltado,
                       help="Quitar el resaltado")
-            if not resaltado["encontrado"]:
+            if resaltado["con_pasajes"] and not resaltado["encontrado"]:
                 st.caption("No pude ubicar el pasaje exacto; esta es la página citada.")
             st.image(resaltado["png"], width="stretch")
             st.divider()
@@ -259,19 +259,24 @@ def agregar_mensaje(mensaje: dict):
 
 
 def nueva_conversacion():
-    st.session_state.update(mensajes=[], conv_id=None, pendientes=[])
+    st.session_state.update(mensajes=[], conv_id=None, pendientes=[], miniaturas={})
 
 
 def abrir_conversacion(conv_id: int):
     mensajes, error = llamar("GET", f"/conversaciones/{conv_id}/mensajes")
     if not error:
-        st.session_state.update(mensajes=mensajes, conv_id=conv_id, pendientes=[])
+        st.session_state.update(mensajes=mensajes, conv_id=conv_id, pendientes=[], miniaturas={})
 
 
 def borrar_conversacion(conv_id: int):
     llamar("DELETE", f"/conversaciones/{conv_id}")
     if st.session_state.conv_id == conv_id:
         nueva_conversacion()
+
+
+def cambiar_clave(numero: int):
+    """Enciende o apaga una clave de Gemini según su interruptor."""
+    llamar("POST", f"/gemini/claves/{numero}", json={"activa": bool(st.session_state[f"clave_gemini_{numero}"])})
 
 
 # ---------------------------------------------------------------- barra lateral
@@ -290,6 +295,19 @@ with st.sidebar:
             st.warning("Modo: PRUEBA")
         # Qué modelos de IA se están usando ahora
         st.markdown(f"🧠 **Chat:** `{estado['chat']}`  \n🔎 **Embeddings:** `{estado['embeddings']}`")
+        if estado.get("gemini"):
+            st.caption("☁️ Gemini activo: se pueden buscar imágenes dentro de los PDFs.")
+        else:
+            st.caption("☁️ Gemini sin clave activa: revisa las claves de abajo o pega `GEMINI_API_KEY` en el `.env`.")
+        datos_claves, _ = llamar("GET", "/gemini/claves")
+        with st.expander("☁️ Claves de Gemini"):
+            iconos = {"lista": "🟢", "en_pausa": "🟠", "invalida": "🔴", "desactivada": "⚪", "sin_configurar": "⚫"}
+            for c in (datos_claves or {}).get("claves", []):
+                st.toggle(f"Clave {c['numero']}: {iconos.get(c['estado'], '')} {c['texto']}",
+                          value=c["activa"], disabled=not c["configurada"], key=f"clave_gemini_{c['numero']}",
+                          on_change=cambiar_clave, args=(c["numero"],))
+            st.caption("Se usan en orden 1, 2, 3. Si una llega a su límite o falla, pasa sola a la siguiente. "
+                       "Las claves 2 y 3 se pegan en `GEMINI_API_KEY_2` y `GEMINI_API_KEY_3` del `.env`.")
         if estado["ollama_activo"] is False:
             st.error("Ollama no responde. ¿Está instalado y corriendo?")
         for faltante in estado["faltan"]:
@@ -420,7 +438,9 @@ def panel_documento():
                 with st.spinner("Marcando la fuente en el PDF..."):
                     png, encontrado = imagen_resaltada(usuario_actual(), nombre, pedido["pagina"],
                                                        tuple(pedido["pasajes"]), giro_extra)
-                resaltado = {"pagina": pedido["pagina"], "png": png, "encontrado": encontrado}
+                resaltado = {"pagina": pedido["pagina"], "png": png, "encontrado": encontrado,
+                             "titulo": pedido.get("titulo", "Fuente de la respuesta"),
+                             "con_pasajes": bool(pedido["pasajes"])}
             except RuntimeError as e:
                 st.warning(str(e))
         visor_pdf(nombre, pdf, datos["giros"] if datos else {}, resaltado)
@@ -434,6 +454,21 @@ def panel_documento():
     if b3.button("📚 Glosario", width="stretch"):
         st.session_state.pendientes.append(("glosario", nombre))
 
+    if (estado or {}).get("gemini"):
+        if st.button("🖼️ Indexar imágenes con Gemini", width="stretch",
+                     help="Envía las imágenes de este PDF a Google (Gemini) para poder buscarlas con una frase. "
+                          "En el plan gratuito, Google puede usar ese contenido para mejorar sus productos."):
+            cab = cabeceras()
+            (datos, error), seg = con_contador(
+                "Indexando imágenes con Gemini",
+                lambda: llamar("POST", f"/documentos/{quote(nombre)}/indexar_imagenes", cab=cab))
+            if error:
+                st.error(error)
+            else:
+                st.success(f"Imágenes indexadas: {datos['indexadas']} de {datos['total']} ({seg:.0f} s).")
+                if datos.get("error"):
+                    st.warning(datos["error"])
+
     guardado, _ = llamar("GET", f"/documentos/{quote(nombre)}/resumen")
     with st.expander("⬇️ Exportar a PDF o Word"):
         botones_exportar(nombre, bool(guardado and any(guardado.values())))
@@ -446,26 +481,51 @@ def _normalizada(texto: str) -> str:
     return " ".join(re.findall(r"\w+", sin))
 
 
+def detalle_tecnico(f: dict) -> str:
+    """Posición del fragmento y por qué se eligió: 'fragmento 12 de 42 · significado 72 % · …'"""
+    partes = []
+    if f.get("posicion") and f.get("total_documento"):
+        partes.append(f"fragmento {f['posicion']} de {f['total_documento']} del documento")
+    if f.get("id") is not None:
+        partes.append(f"id {f['id']}")
+    if "similitud" in f:
+        partes.append(f"parecido por significado {f['similitud'] * 100:.0f} %")
+    if "coincidencia" in f:
+        partes.append(f"palabras de la pregunta {f['coincidencia'] * 100:.0f} %")
+    if "puntaje" in f:
+        partes.append(f"puntaje final {f['puntaje']:.2f}")
+    if f.get("hallado_por"):
+        partes.append(f"hallado por {f['hallado_por']}")
+    return " · ".join(partes)
+
+
 def mostrar_citas(fuentes: list[dict] | None, citas: list[int] | None,
-                  detalle: list[dict] | None = None, indice: int = 0):
+                  detalle: list[dict] | None = None, indice: int = 0,
+                  total_buscado: int | None = None):
     """De dónde salió la respuesta: botones para verla pintada en el PDF y los fragmentos."""
-    if not fuentes:
+    if not fuentes and not detalle:
         return
     citas = citas or []
     for d in detalle or []:
         st.button(f"📍 Ver en el PDF: {d['documento']}, pág. {d['pagina']}",
                   key=f"ver_{indice}_{d['n']}", on_click=ver_en_pdf, args=(d,))
+    if not fuentes:
+        return
     if not detalle:
         usadas = [f for f in fuentes if f.get("n") in citas]
         if usadas:
             st.caption("📎 **Fuente:** " + " · ".join(
                 f"{f['documento']}, pág. {f['pagina']}" for f in usadas))
-    with st.expander(f"Fragmentos consultados ({len(fuentes)})"):
+    de_total = f" de {total_buscado} en los documentos buscados" if total_buscado else ""
+    with st.expander(f"Fragmentos consultados: {len(fuentes)}{de_total}"):
         for f in fuentes:
             marca = " ✅ usado" if f.get("n") in citas else ""
             st.markdown(f"**[{f.get('n', '·')}] {f['documento']} — pág. {f['pagina']}**{marca}")
+            tecnico = detalle_tecnico(f)
+            if tecnico:
+                st.caption(tecnico)
             if f.get("fragmento"):
-                st.caption(f["fragmento"] + "…")
+                st.markdown("> " + f["fragmento"].replace("\n", " "))
 
 
 def mostrar_interpretada(pregunta: str, interpretada: str | None):
@@ -477,14 +537,19 @@ def mostrar_interpretada(pregunta: str, interpretada: str | None):
 def mostrar_tiempos(t, modelo: str | None = None):
     """Línea pequeña con el modelo usado y los tiempos de cada etapa (pruebas de velocidad)."""
     if t:
-        reformular = f"Reformular {t['reformular_ms']} ms · " if t.get("reformular_ms") else ""
-        st.caption(
-            f"🧠 {modelo or '—'} · ⏱ {reformular}Embedding {t.get('embedding_ms', 0)} ms · "
-            f"Búsqueda BD {t.get('busqueda_db_ms', 0)} ms · "
-            f"Ollama: 1ª palabra {t.get('ollama_primer_token_ms', 0)} ms, "
-            f"total {t.get('ollama_ms', 0)} ms · "
-            f"**Total {t.get('total_ms', 0)} ms**"
-        )
+        # Solo las etapas que ocurrieron (una respuesta sin modelo no tiene embedding ni Ollama)
+        etapas = []
+        if t.get("reformular_ms"):
+            etapas.append(f"Reformular {t['reformular_ms']} ms")
+        if "embedding_ms" in t:
+            etapas.append(f"Embedding {t['embedding_ms']} ms")
+        if "busqueda_db_ms" in t:
+            etapas.append(f"Búsqueda BD {t['busqueda_db_ms']} ms")
+        if "ollama_ms" in t:
+            etapas.append(f"Ollama: 1ª palabra {t.get('ollama_primer_token_ms', 0)} ms, "
+                          f"total {t['ollama_ms']} ms")
+        etapas.append(f"**Total {t.get('total_ms', 0)} ms**")
+        st.caption(f"🧠 {modelo or '—'} · ⏱ " + " · ".join(etapas))
 
 
 def preguntar(texto: str):
@@ -503,6 +568,19 @@ def mostrar_sugerencias(indice: int, sugerencias: list[str] | None):
 
 def modelo_en_uso() -> str:
     return (estado or {}).get("chat", "—")
+
+
+def texto_de_cobertura(c: dict) -> str:
+    """'🧩 Resumen basado en 12 de 42 fragmentos (uno por página, págs. 1–12), ≈ 38 % del texto.'"""
+    paginas = c["paginas_usadas"]
+    if len(paginas) > 1 and paginas == list(range(paginas[0], paginas[-1] + 1)):
+        lista = f"págs. {paginas[0]}–{paginas[-1]}"
+    else:
+        lista = "págs. " + ", ".join(str(p) for p in paginas)
+    parcial = "" if c["paginas_usadas"] == c["paginas_total"] or len(paginas) == c["paginas_total"] \
+        else f" de {c['paginas_total']} páginas"
+    return (f"🧩 Resumen basado en {c['fragmentos_usados']} de {c['fragmentos_total']} fragmentos "
+            f"(uno por página: {lista}{parcial}), ≈ {c['porcentaje']} % del texto.")
 
 
 def resumir_en_chat(nombre: str):
@@ -528,6 +606,16 @@ def resumir_en_chat(nombre: str):
             pie = f"🧠 {modelo_en_uso()} · ⏱ Resumen generado en {segundos:.0f} s"
             reloj.caption(pie)
             texto += f"\n\n*{pie}*"
+            cobertura = resultado.get("cobertura")
+            if cobertura:  # cuántos fragmentos y páginas usó realmente el resumen
+                aviso = texto_de_cobertura(cobertura)
+                st.caption(aviso)
+                texto += f"\n\n*{aviso}*"
+                if cobertura.get("cifras_sin_respaldo"):  # el modelo pudo inventar un número
+                    alerta = ("⚠️ El resumen menciona cifras que no aparecen en el texto leído: "
+                              + ", ".join(cobertura["cifras_sin_respaldo"]) + ". Verifícalas en el PDF.")
+                    st.warning(alerta)
+                    texto += f"\n\n*{alerta}*"
             # Después del resumen, 3 preguntas sugeridas que se envían con un clic
             cab = cabeceras()
             (datos, _), _ = con_contador(
@@ -565,20 +653,92 @@ def generar_en_chat(tipo: str, nombre: str):
     agregar_mensaje({"rol": "assistant", "texto": f"{encabezado}\n\n{texto}"})
 
 
-def responder(pregunta: str):
-    """Envía la pregunta a la API (con la memoria de la conversación) y muestra la respuesta."""
+@st.cache_data(show_spinner=False, max_entries=100)
+def obtener_miniatura(usuario: str, imagen_id: int) -> bytes | None:
+    """Descarga una imagen indexada de los documentos (para mostrarla en el chat)."""
+    try:
+        r = httpx.get(f"{API}/imagenes/{imagen_id}", headers=cabeceras(usuario), timeout=30)
+    except httpx.HTTPError:
+        return None
+    return r.content if r.status_code == 200 else None
+
+
+def mostrar_imagenes_encontradas(imagenes: list[dict] | None):
+    """Las imágenes de los PDFs más parecidas a lo que se preguntó, con su porcentaje de parecido."""
+    if not imagenes:
+        return
+    columnas = st.columns(len(imagenes))
+    for columna, im in zip(columnas, imagenes):
+        png = obtener_miniatura(usuario_actual(), im["id"])
+        if png:
+            columna.image(png, width="stretch",
+                          caption=f"{im['documento']} · pág. {im['pagina']} · parecido {im['similitud'] * 100:.0f} %")
+
+
+def mostrar_imagen_adjunta(indice: int, mensaje: dict):
+    """Miniatura de la imagen adjunta y el texto que se leyó en ella."""
+    imagen = mensaje.get("imagen")
+    if not imagen:
+        return
+    for datos in st.session_state.get("miniaturas", {}).get(indice, []):
+        st.image(datos, width=220)
+    if imagen.get("texto"):
+        st.caption(f"🖼️ Texto que leí en la imagen: «{imagen['texto']}»")
+    else:
+        st.caption("🖼️ No encontré letras en la imagen. Todavía no puedo describir lo que muestra: "
+                   "solo leo el texto que contiene.")
+
+
+def leer_imagenes(imagenes: list) -> list[tuple[str, str]]:
+    """Lee el texto de cada imagen adjunta. Devuelve [(nombre, texto)]; texto vacío si no hay letras."""
+    leidas = []
+    for imagen in imagenes:
+        try:
+            r = httpx.post(f"{API}/imagen/leer", headers=cabeceras(), timeout=120,
+                           files={"archivo": (imagen.name, imagen.getvalue())})
+            texto = r.json().get("texto", "") if r.status_code < 400 else ""
+        except httpx.HTTPError:
+            texto = ""
+        leidas.append((imagen.name, texto))
+    return leidas
+
+
+def responder(pregunta: str, imagenes: list | None = None):
+    """Envía la pregunta a la API (con la memoria de la conversación) y muestra la respuesta.
+
+    Si se adjuntaron imágenes, se lee su texto y se agrega a la pregunta para buscar con él.
+    """
     elegidos = documentos_elegidos()
     if elegidos == []:
         st.warning("Marca al menos un documento en la barra lateral para buscar.")
         return
     # Se recuerdan los mensajes anteriores para entender seguimientos como "¿y eso qué significa?"
     historial = [{"rol": m["rol"], "texto": m["texto"]} for m in st.session_state.mensajes[-6:]]
-    agregar_mensaje({"rol": "user", "texto": pregunta})
+
+    texto_de_imagenes = ""
+    nota_imagen = ""
+    if imagenes:
+        with st.spinner("Leyendo la imagen..."):
+            leidas = leer_imagenes(imagenes)
+        texto_de_imagenes = " ".join(t for _, t in leidas)[:500]
+        nota_imagen = "📎 " + ", ".join(n for n, _ in leidas)
+        pregunta = pregunta or "Busca en los documentos lo que dice esta imagen."
+    indice_usuario = len(st.session_state.mensajes)
+    if imagenes:  # las miniaturas se guardan solo en esta sesión (no en la base de datos)
+        st.session_state.setdefault("miniaturas", {})[indice_usuario] = [i.getvalue() for i in imagenes]
+    mensaje_usuario = {"rol": "user", "texto": f"{pregunta}\n\n{nota_imagen}" if nota_imagen else pregunta}
+    if imagenes:
+        mensaje_usuario["imagen"] = {"texto": texto_de_imagenes}
+    agregar_mensaje(mensaje_usuario)
     with st.chat_message("user"):
         st.write(pregunta)
+        mostrar_imagen_adjunta(indice_usuario, mensaje_usuario)
+    # La pregunta que se envía incluye lo leído en la imagen; el usuario ve su pregunta original
+    pregunta_enviada = f"{pregunta} [Texto de la imagen adjunta: {texto_de_imagenes}]" \
+        if texto_de_imagenes else pregunta
     with st.chat_message("assistant"):
         resultado = {"fuentes": []}
-        cuerpo = {"pregunta": pregunta, "documentos": elegidos, "historial": historial}
+        cuerpo = {"pregunta": pregunta_enviada, "documentos": elegidos, "historial": historial}
         with st.spinner("Pensando..."):
             # st.write_stream muestra el texto a medida que llega
             texto = st.write_stream(leer_stream("/chat_stream", resultado, cuerpo))
@@ -586,8 +746,10 @@ def responder(pregunta: str):
             st.error(resultado["error"])
         else:
             mostrar_interpretada(pregunta, resultado.get("pregunta_interpretada"))
+            mostrar_imagenes_encontradas(resultado.get("imagenes"))
             mostrar_citas(resultado["fuentes"], resultado.get("citas"),
-                          resultado.get("citas_detalle"), len(st.session_state.mensajes))
+                          resultado.get("citas_detalle"), len(st.session_state.mensajes),
+                          resultado.get("total_buscado"))
             mostrar_tiempos(resultado.get("tiempos"), resultado.get("modelo"))
             if resultado.get("citas_detalle"):
                 # El visor de la izquierda se abre solo en el pasaje de donde salió la respuesta
@@ -596,9 +758,11 @@ def responder(pregunta: str):
             agregar_mensaje({
                 "rol": "assistant", "texto": texto, "fuentes": resultado["fuentes"],
                 "citas": resultado.get("citas"), "citas_detalle": resultado.get("citas_detalle"),
+                "total_buscado": resultado.get("total_buscado"),
                 "tiempos": resultado.get("tiempos"),
                 "modelo": resultado.get("modelo"),
                 "interpretada": resultado.get("pregunta_interpretada"),
+                "imagenes": resultado.get("imagenes"),
                 "pregunta": pregunta,
             })
 
@@ -610,8 +774,11 @@ def panel_chat():
         for indice, m in enumerate(st.session_state.mensajes):
             with st.chat_message(m["rol"]):
                 st.write(m["texto"])
+                mostrar_imagen_adjunta(indice, m)
                 mostrar_interpretada(m.get("pregunta", ""), m.get("interpretada"))
-                mostrar_citas(m.get("fuentes"), m.get("citas"), m.get("citas_detalle"), indice)
+                mostrar_imagenes_encontradas(m.get("imagenes"))
+                mostrar_citas(m.get("fuentes"), m.get("citas"), m.get("citas_detalle"), indice,
+                              m.get("total_buscado"))
                 mostrar_tiempos(m.get("tiempos"), m.get("modelo"))
                 mostrar_sugerencias(indice, m.get("sugerencias"))
 
@@ -623,12 +790,18 @@ def panel_chat():
             else:
                 generar_en_chat(tipo, nombre)
 
-    pregunta = st.chat_input("Escribe tu pregunta sobre los documentos")
-    if not pregunta:  # o la que el usuario eligió entre las sugeridas
-        pregunta = st.session_state.pop("pregunta_pendiente", None)
-    if pregunta:
+    # El chat acepta texto y también imágenes (PNG o JPG): se lee el texto que contienen
+    valor = st.chat_input("Escribe tu pregunta (puedes adjuntar una imagen)", accept_file=True,
+                          file_type=["png", "jpg", "jpeg"])
+    pregunta, imagenes = "", []
+    if valor:
+        pregunta = (valor.get("text") or "").strip()
+        imagenes = valor.get("files") or []
+    if not pregunta and not imagenes:  # o la que el usuario eligió entre las sugeridas
+        pregunta = st.session_state.pop("pregunta_pendiente", None) or ""
+    if pregunta or imagenes:
         with caja:
-            responder(pregunta)
+            responder(pregunta, imagenes)
 
 
 # ---------- Página: documento a la izquierda, chat a la derecha ----------

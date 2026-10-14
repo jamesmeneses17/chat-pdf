@@ -51,6 +51,37 @@ Abre http://localhost:8501. La API crea las tablas sola al iniciar.
   página de donde salió la respuesta y **pinta de amarillo el pasaje exacto** (también en
   documentos escaneados, usando OCR, y en las hojas giradas). Además se pueden ver los
   fragmentos consultados.
+- **Detalle de los fragmentos:** cada respuesta muestra cuántos fragmentos se consultaron (de cuántos hay),
+  y de cada uno su texto completo, su posición («fragmento 12 de 42»), el parecido por significado,
+  las palabras de la pregunta que contiene, el puntaje final y por qué búsqueda se halló.
+- **Resumen con un fragmento por página:** se toma el fragmento más largo de cada página y se
+  resumen juntos (así el resumen cubre todas las páginas). Debajo se indica cuántos fragmentos y
+  páginas se usaron y qué porcentaje del texto es; si el resumen menciona cifras que no están en
+  el texto leído, lo avisa.
+- **Imágenes del PDF:** «¿cuántas imágenes trae el PDF?» se contesta leyendo el archivo (sin IA),
+  con las páginas que las tienen y las páginas que son un escaneo completo. Qué muestra una imagen
+  (un perro, una planta...) **todavía no se puede saber**: haría falta un modelo de visión.
+- **Varias claves de Gemini:** puedes poner hasta 3 (`GEMINI_API_KEY`, `GEMINI_API_KEY_2`,
+  `GEMINI_API_KEY_3`). Se usan en orden; si una llega a su límite de uso (queda en pausa ~1 min, o ~1 h
+  si se repite) o es rechazada, el sistema pasa solo a la siguiente y **te avisa** en la respuesta.
+  En la barra lateral («☁️ Claves de Gemini») ves el estado de cada una y la enciendes o apagas; eso
+  queda guardado. Las claves nunca se muestran. Tras editar el `.env`, reinicia `uvicorn`.
+- **Buscar dentro de las imágenes con Gemini (nube, opcional):** con una clave en `GEMINI_API_KEY`
+  del `.env`, al subir un PDF sus imágenes se envían a Google (`gemini-embedding-2`, que pone texto e
+  imágenes en un mismo espacio de vectores) y quedan guardadas. Después se pregunta «¿hay una imagen
+  de un perro?» y se muestran **solo las que coinciden**: las que tienen un parecido de al menos
+  `IMAGENES_MIN_SIM` (0,585) y están a menos de `IMAGENES_MARGEN` (0,06) de la mejor. Así, si se
+  pregunta por el gato, sale el gato y no el perro ni la lombriz; si se pregunta por «un animal»,
+  salen todos los animales; y si no hay nada parecido («una persona»), lo dice y muestra cuánto
+  se acercó la más cercana. Esos valores se calibraron con puntajes reales de Gemini sobre 6
+  ilustraciones y 18 frases: 12 de 12 pruebas exactas, frente a un 43 % de acierto al mostrar
+  siempre las 3 primeras. Con fotos reales pueden necesitar ajuste. El parecido sigue siendo una
+  estimación: confírmalo mirando la imagen. Las páginas que son un
+  escaneo completo **no** se envían por defecto (`IMAGENES_INCLUIR_ESCANEADAS=0`). En el plan
+  gratuito Google puede usar el contenido enviado para mejorar sus productos. Sin clave, esta
+  función se desactiva y todo lo demás sigue local.
+- **Chat con imágenes:** se puede adjuntar una imagen PNG/JPG junto a la pregunta; se lee su
+  **texto** con OCR y se usa para buscar en los documentos. No describe lo que la imagen muestra.
 - **Varios PDFs:** se busca en todos tus documentos o solo en los que marques en la barra lateral.
 - **Memoria:** entiende seguimientos como «¿y eso qué significa?» usando los últimos mensajes.
 - **Exportar:** el resumen (con puntos clave y glosario) y la conversación se descargan en PDF o Word.
