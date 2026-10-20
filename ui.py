@@ -1,5 +1,6 @@
-"""Interfaz Streamlit: documento (izquierda) y chat (derecha) al mismo tiempo."""
+"""Interfaz Streamlit de «Base de Conocimiento IA»: documento (izquierda) y chat (derecha) al mismo tiempo."""
 import hashlib
+from contextlib import nullcontext
 import json
 import queue
 import re
@@ -18,7 +19,7 @@ API = config.API_URL
 ALTURA = 700  # alto (px) del visor de PDF y de la caja del chat
 USUARIO_POR_DEFECTO = "invitado"
 
-st.set_page_config(page_title="Chat con PDFs", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Base de Conocimiento IA", page_icon="🧠", layout="wide")
 
 
 # ---------------------------------------------------------------- usuario
@@ -192,8 +193,14 @@ def imagen_resaltada(usuario: str, nombre: str, pagina: int, pasajes: tuple, gir
 
 
 def ver_en_pdf(detalle: dict):
-    """Se ejecuta al pulsar '📍 Ver en el PDF': el visor muestra ese pasaje pintado."""
-    st.session_state.resaltar = detalle
+    """Se ejecuta al pulsar '📍 Ver en el PDF': el visor muestra ese pasaje pintado.
+
+    Si la fuente es un audio o video, el reproductor del visor arranca en ese minuto.
+    """
+    if detalle.get("inicio") is not None:
+        st.session_state.reproducir = detalle
+    else:
+        st.session_state.resaltar = detalle
     st.session_state.doc_actual = detalle["documento"]
 
 
@@ -201,7 +208,7 @@ def quitar_resaltado():
     st.session_state.pop("resaltar", None)
 
 
-def visor_pdf(nombre: str, pdf: bytes, giros: dict, resaltado: dict | None = None):
+def visor_pdf(nombre: str, pdf: bytes, giros: dict, resaltado: dict | None = None, caja: bool = True):
     """Muestra todas las páginas una debajo de otra, con scroll, ajustadas al ancho.
 
     Así se ven completas tanto las hojas verticales como las horizontales.
@@ -221,7 +228,8 @@ def visor_pdf(nombre: str, pdf: bytes, giros: dict, resaltado: dict | None = Non
     def cargar_mas():
         st.session_state[k_visibles] = visibles + PAGINAS_POR_TANDA
 
-    with st.container(height=ALTURA):  # caja con scroll para recorrer todo el PDF
+    # caja con scroll para recorrer todo el PDF (si hay varios documentos, la caja es una sola y la pone el panel)
+    with (st.container(height=ALTURA) if caja else nullcontext()):
         if resaltado:
             c1, c2 = st.columns([6, 1], vertical_alignment="center")
             c1.markdown(f"📍 **{resaltado['titulo']} — pág. {resaltado['pagina']}**")
@@ -279,8 +287,54 @@ def cambiar_clave(numero: int):
     llamar("POST", f"/gemini/claves/{numero}", json={"activa": bool(st.session_state[f"clave_gemini_{numero}"])})
 
 
+def guardar_clave(numero: int):
+    """Guarda la clave pegada en el campo y lo vacía (la clave no se vuelve a mostrar)."""
+    texto = st.session_state.get(f"clave_txt_{numero}", "")
+    _, error = llamar("PUT", f"/gemini/claves/{numero}/clave", json={"clave": texto})
+    st.session_state.mensaje_clave = (numero, error or "Clave guardada.", bool(error))
+    st.session_state[f"clave_txt_{numero}"] = ""
+
+
+NOMBRES_EMBEDDINGS = {"ollama": "Ollama · nomic-embed-text (local)",
+                      "gemma2": "EmbeddingGemma 2 (local, multimodal)",
+                      "gemma": "Ollama · EmbeddingGemma 1 (local)",
+                      "gemini": "Gemini · gemini-embedding-2 (nube)"}
+
+
+def cambiar_embeddings():
+    """Elige con qué modelo se calculan los vectores de los PDFs nuevos."""
+    proveedor = st.session_state.get("embeddings_modelo", "ollama")
+    _, error = llamar("POST", "/embeddings", json={"proveedor": proveedor})
+    if error:
+        st.session_state.mensaje_clave = (0, error, True)
+
+
+NOMBRES_CHAT = {"ollama": "Local · Ollama (qwen2.5:1.5b)", "llamacpp": "Local · llama.cpp (qwen2.5:1.5b)",
+                "gemini": "Nube · Gemini (API)"}
+
+
+def cambiar_chat():
+    """Elige quién escribe las respuestas: el modelo local o uno de la nube."""
+    _, error = llamar("POST", "/chat/modelo", json={"proveedor": st.session_state.get("chat_modelo")})
+    if error:
+        st.session_state.mensaje_clave = (0, error, True)
+
+
+NOMBRES_MEDIOS = {"gemma2": "EmbeddingGemma 2 (local): imágenes, audio y video",
+                  "gemini": "Gemini (nube): solo imágenes"}
+
+
+def cambiar_medios():
+    """Elige con qué modelo se calculan los vectores de imágenes, audios y videos nuevos."""
+    _, error = llamar("POST", "/embeddings/medios", json={"proveedor": st.session_state.get("medios_modelo")})
+    if error:
+        st.session_state.mensaje_clave = (0, error, True)
+
+
 # ---------------------------------------------------------------- barra lateral
 with st.sidebar:
+    st.markdown("## 🧠 Base de Conocimiento IA")
+    st.caption("PDFs · imágenes · audio · video")
     st.text_input("👤 Usuario", key="usuario_txt", value=USUARIO_POR_DEFECTO,
                   help="Cada usuario ve solo sus documentos y conversaciones. "
                        "No usa contraseña: solo separa la información de cada nombre.")
@@ -306,8 +360,45 @@ with st.sidebar:
                 st.toggle(f"Clave {c['numero']}: {iconos.get(c['estado'], '')} {c['texto']}",
                           value=c["activa"], disabled=not c["configurada"], key=f"clave_gemini_{c['numero']}",
                           on_change=cambiar_clave, args=(c["numero"],))
-            st.caption("Se usan en orden 1, 2, 3. Si una llega a su límite o falla, pasa sola a la siguiente. "
-                       "Las claves 2 y 3 se pegan en `GEMINI_API_KEY_2` y `GEMINI_API_KEY_3` del `.env`.")
+            st.caption("Se usan en orden 1, 2, 3. Si una llega a su límite o falla, pasa sola a la siguiente.")
+            st.markdown("**Agregar o cambiar una clave**")
+            numero_clave = st.selectbox("Clave", [1, 2, 3], key="clave_elegida", label_visibility="collapsed",
+                                        format_func=lambda n: f"Clave {n}")
+            st.text_input("Pega la clave", type="password", key=f"clave_txt_{numero_clave}",
+                          placeholder="Pega aquí la clave de Gemini", label_visibility="collapsed")
+            st.button("💾 Guardar clave", on_click=guardar_clave, args=(numero_clave,), width="stretch")
+            aviso = st.session_state.pop("mensaje_clave", None)
+            if aviso:
+                (st.error if aviso[2] else st.success)(aviso[1])
+            st.caption("Se guardan en la base de datos de este computador y nunca se muestran. "
+                       "Para borrar una, guarda el campo vacío.")
+        modelo_emb, _ = llamar("GET", "/embeddings")
+        actual = (modelo_emb or {}).get("proveedor", "ollama")
+        st.session_state["embeddings_modelo"] = actual  # siempre refleja lo guardado (p. ej. si fue rechazado)
+        st.selectbox("🔎 Embeddings al subir PDFs", list(NOMBRES_EMBEDDINGS), key="embeddings_modelo",
+                     format_func=NOMBRES_EMBEDDINGS.get, on_change=cambiar_embeddings,
+                     help="Con qué modelo se calculan los vectores de los PDFs que subas desde ahora. "
+                          "Los PDFs ya subidos conservan el suyo. Gemini (nube) es mucho más rápido, pero "
+                          "el texto de los PDFs se envía a Google. La respuesta del chat siempre es local.")
+        if actual == "gemini":
+            st.caption("⚠️ El texto de los PDFs nuevos se envía a Google. La respuesta del chat sigue siendo local.")
+        chat_emb, _ = llamar("GET", "/chat/modelo")
+        st.session_state["chat_modelo"] = (chat_emb or {}).get("proveedor", "ollama")
+        st.selectbox("🧠 Quién escribe las respuestas", list(NOMBRES_CHAT), key="chat_modelo",
+                     format_func=lambda k: (f"Nube · Gemini ({(chat_emb or {}).get('modelo_nube', 'API')})"
+                                            if k == "gemini" else
+                                            NOMBRES_CHAT[k].replace("qwen2.5:1.5b", (chat_emb or {}).get("modelo_local", ""))),
+                     on_change=cambiar_chat,
+                     help="Local: el modelo corre en tu computador, sin internet. Nube: Gemini por API (con tus "
+                          "claves); también es el que puede VER las imágenes para describirlas.")
+        if (chat_emb or {}).get("proveedor") == "gemini":
+            st.caption("⚠️ Tus preguntas y los fragmentos encontrados se envían a Google para escribir la respuesta.")
+        medios_emb, _ = llamar("GET", "/embeddings/medios")
+        st.session_state["medios_modelo"] = (medios_emb or {}).get("proveedor", "gemma2")
+        st.selectbox("🖼️ Embeddings de imágenes, audio y video", list(NOMBRES_MEDIOS), key="medios_modelo",
+                     format_func=NOMBRES_MEDIOS.get, on_change=cambiar_medios,
+                     help="EmbeddingGemma 2 entiende texto, imágenes, audio y video en un mismo espacio y corre "
+                          "en tu computador. Gemini solo sirve para imágenes y las envía a Google.")
         if estado["ollama_activo"] is False:
             st.error("Ollama no responde. ¿Está instalado y corriendo?")
         for faltante in estado["faltan"]:
@@ -318,7 +409,9 @@ with st.sidebar:
     st.divider()
     st.subheader("📄 Documentos")
     # La clave incluye al usuario: al cambiar de usuario el cargador queda vacío
-    archivos = st.file_uploader("Sube uno o más PDFs", type="pdf", accept_multiple_files=True,
+    archivos = st.file_uploader("Sube PDFs, audios o videos cortos",
+                                type=["pdf", "mp3", "wav", "m4a", "ogg", "flac", "mp4", "webm", "mov", "mkv", "avi"],
+                                accept_multiple_files=True,
                                 key=f"subir_{usuario_actual()}")
     if archivos:
         for archivo in archivos:
@@ -344,14 +437,36 @@ with st.sidebar:
             st.session_state.doc_actual = archivo.name
             st.session_state.pendientes.append(("resumen", archivo.name))
 
+    carpeta, _ = llamar("GET", "/carpeta")
+    if carpeta and carpeta["existe"]:
+        faltan = [a for a in carpeta["archivos"] if not a["indexado"]]
+        if st.button(f"📂 Indexar carpeta de conocimiento ({len(faltan)} nuevos)", width="stretch",
+                     disabled=not faltan,
+                     help=f"Indexa los PDFs, audios y videos que haya en {carpeta['carpeta']}"):
+            cab = cabeceras()
+            (indexada, error), seg = con_contador(
+                "Indexando la carpeta (los audios y videos tardan más)",
+                lambda: llamar("POST", "/carpeta/indexar", cab=cab))
+            if error:
+                st.error(error)
+            else:
+                for r in indexada["resultados"]:
+                    (st.success if r["ok"] else st.error)(f"{r['nombre']}: {r['mensaje']}")
+                    for aviso in r["advertencias"]:
+                        st.warning(aviso)
+                st.caption(f"⏱ {seg:.0f} s")
+
     docs, error = llamar("GET", "/documentos")
     nombres = [d["nombre"] for d in docs] if docs else []
+    tipo_de = {d["nombre"]: d.get("tipo", "pdf") for d in docs or []}
     if docs:
         st.caption("Marca los documentos en los que quieres buscar:")
         for d in docs:
             col1, col2 = st.columns([6, 1], vertical_alignment="center")
             fecha = (d.get("creado") or "")[:10]
-            col1.checkbox(f"{d['nombre']} ({d['fragmentos']})", value=True,
+            nube = {"gemini": " ☁️", "gemma": " 💎", "gemma2": " 💎2"}.get(d.get("embeddings"), "")
+            icono = {"audio": "🎵 ", "video": "🎬 "}.get(d.get("tipo"), "")
+            col1.checkbox(f"{icono}{d['nombre']} ({d['fragmentos']}){nube}", value=True,
                           key=f"buscar_{d['nombre']}", help=f"Subido el {fecha}" if fecha else None)
             if col2.button("🗑", key=f"del_{d['nombre']}", help="Eliminar"):
                 _, error = llamar("DELETE", f"/documentos/{quote(d['nombre'])}")
@@ -421,29 +536,58 @@ def panel_documento():
     if not nombres:
         st.info("Sube un PDF desde la barra lateral para verlo aquí.")
         return
-    if st.session_state.get("doc_actual") not in nombres:
-        st.session_state.doc_actual = nombres[0]
-    nombre = st.selectbox("Documento", nombres, key="doc_actual", label_visibility="collapsed")
-
-    pdf, error = obtener_pdf(nombre)
-    if error:
-        st.warning(error)
+    # Se muestran solo los documentos marcados en la barra lateral
+    marcados = [n for n in nombres if st.session_state.get(f"buscar_{n}", True)]
+    pedido = st.session_state.get("resaltar")
+    escuchar = st.session_state.get("reproducir")
+    for cita in (pedido, escuchar):
+        if cita and cita["documento"] in nombres and cita["documento"] not in marcados:
+            marcados.append(cita["documento"])  # la cita que se quiere ver siempre se muestra
+    if not marcados:
+        st.info("Marca en la barra lateral el documento que quieres ver.")
+        return
+    if st.session_state.get("doc_actual") not in marcados:
+        st.session_state.doc_actual = marcados[0]
+    if len(marcados) > 1:
+        nombre = st.selectbox("Documento para resumen, puntos clave y exportar", marcados, key="doc_actual")
     else:
-        datos, _ = llamar("GET", f"/documentos/{quote(nombre)}/giros")
-        resaltado = None
-        pedido = st.session_state.get("resaltar")
-        if pedido and pedido["documento"] == nombre:
-            giro_extra = st.session_state.get(f"giro_{nombre}_{pedido['pagina']}", 0)
-            try:
-                with st.spinner("Marcando la fuente en el PDF..."):
-                    png, encontrado = imagen_resaltada(usuario_actual(), nombre, pedido["pagina"],
-                                                       tuple(pedido["pasajes"]), giro_extra)
-                resaltado = {"pagina": pedido["pagina"], "png": png, "encontrado": encontrado,
-                             "titulo": pedido.get("titulo", "Fuente de la respuesta"),
-                             "con_pasajes": bool(pedido["pasajes"])}
-            except RuntimeError as e:
-                st.warning(str(e))
-        visor_pdf(nombre, pdf, datos["giros"] if datos else {}, resaltado)
+        nombre = marcados[0]
+        st.session_state.doc_actual = nombre
+        st.caption(f"📄 {nombre}")
+
+    multiples = len(marcados) > 1
+    with (st.container(height=ALTURA) if multiples else nullcontext()):  # varios: un solo scroll
+        for doc in marcados:
+            if multiples:
+                st.markdown(f"#### {'🎵' if tipo_de.get(doc) == 'audio' else '🎬' if tipo_de.get(doc) == 'video' else '📄'} {doc}")
+            if tipo_de.get(doc, "pdf") != "pdf":  # audio o video suelto: se reproduce
+                datos_medio = obtener_medio_suelto(usuario_actual(), doc)
+                if datos_medio is None:
+                    st.warning("No pude cargar ese archivo.")
+                else:
+                    desde = int(escuchar["inicio"]) if escuchar and escuchar["documento"] == doc else 0
+                    if desde:
+                        st.caption(f"▶ Reproduciendo desde {_minutos(desde)}")
+                    (st.audio if tipo_de[doc] == "audio" else st.video)(datos_medio, start_time=desde)
+                continue
+            pdf, error = obtener_pdf(doc)
+            if error:
+                st.warning(error)
+                continue
+            datos, _ = llamar("GET", f"/documentos/{quote(doc)}/giros")
+            resaltado = None
+            if pedido and pedido["documento"] == doc:
+                giro_extra = st.session_state.get(f"giro_{doc}_{pedido['pagina']}", 0)
+                try:
+                    with st.spinner("Marcando la fuente en el PDF..."):
+                        png, encontrado = imagen_resaltada(usuario_actual(), doc, pedido["pagina"],
+                                                           tuple(pedido["pasajes"]), giro_extra)
+                    resaltado = {"pagina": pedido["pagina"], "png": png, "encontrado": encontrado,
+                                 "titulo": pedido.get("titulo", "Fuente de la respuesta"),
+                                 "con_pasajes": bool(pedido["pasajes"])}
+                except RuntimeError as e:
+                    st.warning(str(e))
+            visor_pdf(doc, pdf, datos["giros"] if datos else {}, resaltado, caja=not multiples)
 
     # El resultado de estos botones se escribe en el chat, no aquí
     b1, b2, b3 = st.columns(3)
@@ -454,20 +598,21 @@ def panel_documento():
     if b3.button("📚 Glosario", width="stretch"):
         st.session_state.pendientes.append(("glosario", nombre))
 
-    if (estado or {}).get("gemini"):
-        if st.button("🖼️ Indexar imágenes con Gemini", width="stretch",
-                     help="Envía las imágenes de este PDF a Google (Gemini) para poder buscarlas con una frase. "
-                          "En el plan gratuito, Google puede usar ese contenido para mejorar sus productos."):
-            cab = cabeceras()
-            (datos, error), seg = con_contador(
-                "Indexando imágenes con Gemini",
-                lambda: llamar("POST", f"/documentos/{quote(nombre)}/indexar_imagenes", cab=cab))
-            if error:
-                st.error(error)
-            else:
-                st.success(f"Imágenes indexadas: {datos['indexadas']} de {datos['total']} ({seg:.0f} s).")
-                if datos.get("error"):
-                    st.warning(datos["error"])
+    if tipo_de.get(nombre, "pdf") == "pdf" and st.button("🖼️ Indexar imágenes, audio y video", width="stretch",
+                 help="Calcula los vectores de las imágenes de este PDF y de los audios y videos que traiga "
+                      "adjuntos, para poder buscarlos con una frase. Con EmbeddingGemma 2 todo queda en tu "
+                      "computador; con Gemini las imágenes se envían a Google."):
+        cab = cabeceras()
+        (datos, error), seg = con_contador(
+            "Indexando imágenes, audio y video",
+            lambda: llamar("POST", f"/documentos/{quote(nombre)}/indexar_imagenes", cab=cab))
+        if error:
+            st.error(error)
+        else:
+            st.success(f"Imágenes indexadas: {datos['indexadas']} de {datos['total']} · audios: "
+                       f"{datos.get('audios', 0)} · videos: {datos.get('videos', 0)} ({seg:.0f} s).")
+            if datos.get("error"):
+                st.warning(datos["error"])
 
     guardado, _ = llamar("GET", f"/documentos/{quote(nombre)}/resumen")
     with st.expander("⬇️ Exportar a PDF o Word"):
@@ -506,9 +651,20 @@ def mostrar_citas(fuentes: list[dict] | None, citas: list[int] | None,
     if not fuentes and not detalle:
         return
     citas = citas or []
-    for d in detalle or []:
-        st.button(f"📍 Ver en el PDF: {d['documento']}, pág. {d['pagina']}",
-                  key=f"ver_{indice}_{d['n']}", on_click=ver_en_pdf, args=(d,))
+    detalle = detalle or []
+    if len(detalle) > 4:  # p. ej. el resumen: una fuente por página, en un desplegable y con botones cortos
+        with st.expander(f"📍 Ver en el PDF de dónde salió esto ({len(detalle)} páginas)"):
+            columnas = st.columns(3)
+            for i, d in enumerate(detalle):
+                columnas[i % 3].button(f"📍 pág. {d['pagina']}", key=f"ver_{indice}_{d['n']}",
+                                       on_click=ver_en_pdf, args=(d,), width="stretch")
+    else:
+        for d in detalle:
+            if d.get("inicio") is not None:
+                etiqueta = f"▶ Reproducir desde {_minutos(d['inicio'])}: {d['documento']}"
+            else:
+                etiqueta = f"📍 Ver en el PDF: {d['documento']}, pág. {d['pagina']}"
+            st.button(etiqueta, key=f"ver_{indice}_{d['n']}", on_click=ver_en_pdf, args=(d,))
     if not fuentes:
         return
     if not detalle:
@@ -520,7 +676,8 @@ def mostrar_citas(fuentes: list[dict] | None, citas: list[int] | None,
     with st.expander(f"Fragmentos consultados: {len(fuentes)}{de_total}"):
         for f in fuentes:
             marca = " ✅ usado" if f.get("n") in citas else ""
-            st.markdown(f"**[{f.get('n', '·')}] {f['documento']} — pág. {f['pagina']}**{marca}")
+            donde = f"min {_minutos(f['inicio'])}" if f.get("inicio") is not None else f"pág. {f['pagina']}"
+            st.markdown(f"**[{f.get('n', '·')}] {f['documento']} — {donde}**{marca}")
             tecnico = detalle_tecnico(f)
             if tecnico:
                 st.caption(tecnico)
@@ -585,7 +742,7 @@ def texto_de_cobertura(c: dict) -> str:
 
 def resumir_en_chat(nombre: str):
     """Escribe el resumen del PDF dentro de la conversación, palabra por palabra."""
-    sugerencias = []
+    sugerencias, detalle_resumen = [], []
     with st.chat_message("assistant"):
         encabezado = f"📄 **{nombre}** — resumen:"
         st.write(encabezado)
@@ -611,6 +768,8 @@ def resumir_en_chat(nombre: str):
                 aviso = texto_de_cobertura(cobertura)
                 st.caption(aviso)
                 texto += f"\n\n*{aviso}*"
+                detalle_resumen = cobertura.get("detalle") or []
+                mostrar_citas(None, None, detalle_resumen, len(st.session_state.mensajes))
                 if cobertura.get("cifras_sin_respaldo"):  # el modelo pudo inventar un número
                     alerta = ("⚠️ El resumen menciona cifras que no aparecen en el texto leído: "
                               + ", ".join(cobertura["cifras_sin_respaldo"]) + ". Verifícalas en el PDF.")
@@ -625,7 +784,7 @@ def resumir_en_chat(nombre: str):
             sugerencias = datos["preguntas"] if datos else []
             mostrar_sugerencias(len(st.session_state.mensajes), sugerencias)
     agregar_mensaje({"rol": "assistant", "texto": f"{encabezado}\n\n{texto}",
-                     "sugerencias": sugerencias})
+                     "sugerencias": sugerencias, "citas_detalle": detalle_resumen})
 
 
 ETIQUETAS = {"puntos_clave": ("🔑", "puntos clave"), "glosario": ("📚", "glosario")}
@@ -663,16 +822,57 @@ def obtener_miniatura(usuario: str, imagen_id: int) -> bytes | None:
     return r.content if r.status_code == 200 else None
 
 
+@st.cache_data(show_spinner=False, max_entries=20)
+def obtener_archivo_de_medio(usuario: str, imagen_id: int) -> bytes | None:
+    """El audio o video original al que pertenece un resultado."""
+    try:
+        r = httpx.get(f"{API}/medios/{imagen_id}/archivo", headers=cabeceras(usuario), timeout=120)
+    except httpx.HTTPError:
+        return None
+    return r.content if r.status_code == 200 else None
+
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def obtener_medio_suelto(usuario: str, nombre: str) -> bytes | None:
+    """El audio o video de un documento suelto, para el visor."""
+    try:
+        r = httpx.get(f"{API}/documentos/{quote(nombre)}/archivo_medio", headers=cabeceras(usuario), timeout=120)
+    except httpx.HTTPError:
+        return None
+    return r.content if r.status_code == 200 else None
+
+
+def _minutos(segundos: float | None) -> str:
+    s = int(segundos or 0)
+    return f"{s // 60}:{s % 60:02d}"
+
+
 def mostrar_imagenes_encontradas(imagenes: list[dict] | None):
-    """Las imágenes de los PDFs más parecidas a lo que se preguntó, con su porcentaje de parecido."""
+    """Imágenes, audios y videos más parecidos a lo que se preguntó, con su porcentaje de parecido."""
     if not imagenes:
         return
-    columnas = st.columns(len(imagenes))
-    for columna, im in zip(columnas, imagenes):
-        png = obtener_miniatura(usuario_actual(), im["id"])
-        if png:
-            columna.image(png, width="stretch",
-                          caption=f"{im['documento']} · pág. {im['pagina']} · parecido {im['similitud'] * 100:.0f} %")
+    for inicio in range(0, len(imagenes), 3):
+        grupo = imagenes[inicio:inicio + 3]
+        for columna, im in zip(st.columns(3), grupo):
+            tipo = im.get("tipo", "imagen")
+            parecido = f"parecido {im['similitud'] * 100:.0f} %"
+            with columna:
+                if tipo == "imagen":
+                    png = obtener_miniatura(usuario_actual(), im["id"])
+                    if png:
+                        st.image(png, width="stretch",
+                                 caption=f"{im['documento']} · pág. {im['pagina']} · {parecido}")
+                    continue
+                desde = f"desde {_minutos(im.get('inicio'))}"
+                archivo = obtener_archivo_de_medio(usuario_actual(), im["id"])
+                if tipo == "audio":
+                    st.caption(f"🎵 {im.get('nombre') or im['documento']} · {desde} · {parecido}")
+                    if archivo:
+                        st.audio(archivo, start_time=int(im.get("inicio") or 0))
+                else:
+                    st.caption(f"🎬 {im.get('nombre') or im['documento']} · {desde} · {parecido}")
+                    if archivo:
+                        st.video(archivo, start_time=int(im.get("inicio") or 0))
 
 
 def mostrar_imagen_adjunta(indice: int, mensaje: dict):

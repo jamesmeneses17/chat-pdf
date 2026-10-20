@@ -6,7 +6,25 @@ import json
 
 import httpx
 
-from app import config
+from app import config, db, gemini, llamacpp
+
+# ollama = modelo local con Ollama · llamacpp = el mismo modelo local con llama.cpp · gemini = nube (API)
+PROVEEDORES_CHAT = ("ollama", "llamacpp", "gemini")
+
+
+def proveedor_chat() -> str:
+    """Quién escribe las respuestas del chat (se elige en la interfaz)."""
+    try:
+        elegido = db.obtener_ajuste("proveedor_chat", "ollama")
+    except Exception:
+        elegido = "ollama"
+    return elegido if elegido in PROVEEDORES_CHAT else "ollama"
+
+
+def fijar_proveedor_chat(proveedor: str):
+    if proveedor not in PROVEEDORES_CHAT:
+        raise ValueError(f"El modelo de chat debe ser uno de: {', '.join(PROVEEDORES_CHAT)}.")
+    db.guardar_ajuste("proveedor_chat", proveedor)
 
 MENSAJE_SIN_OLLAMA = "No se pudo conectar con Ollama. ¿Está instalado y corriendo?"
 
@@ -72,6 +90,10 @@ def _respuesta_ollama_stream(prompt: str):
 
 def nombre_modelo_chat() -> str:
     """Nombre del modelo que genera las respuestas (para mostrarlo en la interfaz)."""
+    if proveedor_chat() == "gemini":
+        return f"{config.GEMINI_CHAT_MODEL} (nube)"
+    if proveedor_chat() == "llamacpp":
+        return f"{config.CHAT_MODEL} (llama.cpp)"
     return config.CHAT_MODEL if config.AI_MODE == "ollama" else "simulado (modo prueba)"
 
 
@@ -95,9 +117,11 @@ def info_modelos() -> dict:
     def esta(nombre: str) -> bool:
         return nombre in instalados or f"{nombre}:latest" in instalados
 
-    faltan = [m for m in (config.CHAT_MODEL, config.EMBED_MODEL) if activo and not esta(m)]
+    necesarios = ((config.EMBED_MODEL,) if proveedor_chat() in ("gemini", "llamacpp")
+                  else (config.CHAT_MODEL, config.EMBED_MODEL))
+    faltan = [m for m in necesarios if activo and not esta(m)]
     return {
-        "chat": config.CHAT_MODEL,
+        "chat": nombre_modelo_chat(),
         "embeddings": config.EMBED_MODEL,
         "ollama_activo": activo,
         "faltan": faltan,
@@ -105,6 +129,10 @@ def info_modelos() -> dict:
 
 
 def generar_respuesta(prompt: str) -> str:
+    if proveedor_chat() == "gemini":
+        return gemini.generar(prompt)
+    if proveedor_chat() == "llamacpp":
+        return llamacpp.generar(prompt)
     if config.AI_MODE == "ollama":
         return _respuesta_ollama(prompt)
     return _respuesta_mock(prompt)
@@ -112,6 +140,14 @@ def generar_respuesta(prompt: str) -> str:
 
 def generar_respuesta_stream(prompt: str):
     """Igual que generar_respuesta, pero entrega la respuesta por pedazos."""
+    if proveedor_chat() == "gemini":  # la nube responde de una vez; se entrega en pedazos pequeños
+        texto = gemini.generar(prompt)
+        for i in range(0, len(texto), 24):
+            yield texto[i:i + 24]
+        return
+    if proveedor_chat() == "llamacpp":
+        yield from llamacpp.generar_stream(prompt)
+        return
     if config.AI_MODE == "ollama":
         yield from _respuesta_ollama_stream(prompt)
     else:

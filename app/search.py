@@ -107,8 +107,7 @@ def buscar_similares(pregunta: str, usuario: str, documentos: list[str] | None =
     solo_texto = es_pregunta_de_opciones(pregunta)  # sin los bloques de "respuestas marcadas"
     pregunta = expandir_pregunta(pregunta)  # solo para buscar; el usuario ve su pregunta original
     t0 = time.perf_counter()
-    vector = np.array(obtener_embedding(pregunta))
-    t1 = time.perf_counter()
+    t1 = t0
 
     palabras = _palabras_clave(pregunta)
     consulta_texto = " | ".join(palabras)  # cualquiera de las palabras (OR)
@@ -121,15 +120,26 @@ def buscar_similares(pregunta: str, usuario: str, documentos: list[str] | None =
         extra.append(documentos)
 
     with db.conectar() as conn:
+        # Los fragmentos pueden venir de modelos distintos (Ollama / Gemini): la pregunta se convierte
+        # en vector con cada uno de los modelos que haya entre los documentos donde se busca
+        proveedores = [p for (p,) in conn.execute(
+            f"SELECT DISTINCT proveedor FROM chunks WHERE {filtro}", extra).fetchall()] or ["ollama"]
+        vectores = {p: np.array(obtener_embedding(pregunta, p)) for p in proveedores}
+        t1 = time.perf_counter()
+
         # 1. Por significado. <=> es la distancia coseno: menor distancia = más parecido
-        por_vectores = conn.execute(
-            f"""
-            SELECT id, documento, pagina, contenido, embedding <=> %s AS distancia
-            FROM chunks WHERE {filtro}
-            ORDER BY embedding <=> %s LIMIT %s
-            """,
-            (vector, *extra, vector, n),
-        ).fetchall()
+        por_vectores = []
+        for p, vector in vectores.items():
+            por_vectores += conn.execute(
+                f"""
+                SELECT id, documento, pagina, contenido, embedding <=> %s AS distancia
+                FROM chunks WHERE {filtro} AND proveedor = %s
+                ORDER BY embedding <=> %s LIMIT %s
+                """,
+                (vector, *extra, p, vector, n),
+            ).fetchall()
+        por_vectores.sort(key=lambda f: f[4])
+        por_vectores = por_vectores[:n]
 
         # 2. Por palabras (texto completo en español)
         por_palabras = []
@@ -149,9 +159,11 @@ def buscar_similares(pregunta: str, usuario: str, documentos: list[str] | None =
         distancias = {f[0]: float(f[4]) for f in por_vectores}
         faltan = [f[0] for f in por_palabras if f[0] not in distancias]
         if faltan:
-            for id_, distancia in conn.execute(
-                    "SELECT id, embedding <=> %s FROM chunks WHERE id = ANY(%s)", (vector, faltan)):
-                distancias[id_] = float(distancia)
+            for p, vector in vectores.items():
+                for id_, distancia in conn.execute(
+                        "SELECT id, embedding <=> %s FROM chunks WHERE id = ANY(%s) AND proveedor = %s",
+                        (vector, faltan, p)):
+                    distancias[id_] = float(distancia)
 
     # 3. Reordenamiento final de todos los candidatos
     candidatos = {f[0]: f[1:4] for f in [*por_vectores, *por_palabras]}  # id -> (doc, pág, texto)
@@ -198,12 +210,15 @@ def buscar_similares(pregunta: str, usuario: str, documentos: list[str] | None =
                 """,
                 (usuario, [f["id"] for f in elegidos]))}
             total_buscado = conn.execute(f"SELECT COUNT(*) FROM chunks WHERE {filtro}", extra).fetchone()[0]
+            inicios = dict(conn.execute("SELECT id, inicio FROM chunks WHERE id = ANY(%s)",
+                                        ([f["id"] for f in elegidos],)).fetchall())
         for f in elegidos:
+            f["inicio"] = inicios.get(f["id"])  # solo los de audio / video
             f["posicion"], f["total_documento"] = posiciones.get(f["id"], (None, None))
             f["total_buscado"] = total_buscado
     t2 = time.perf_counter()
 
     if tiempos is not None:
-        tiempos["embedding_ms"] = round((t1 - t0) * 1000)  # pregunta -> vector (Ollama)
+        tiempos["embedding_ms"] = round((t1 - t0) * 1000)  # pregunta -> vector
         tiempos["busqueda_db_ms"] = round((t2 - t1) * 1000)  # búsquedas + reordenamiento
     return elegidos

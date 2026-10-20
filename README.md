@@ -1,4 +1,6 @@
-# Chat con PDFs (RAG local)
+# Base de Conocimiento IA (antes «Chat con PDFs»)
+
+PDFs, imágenes, audios y videos cortos en una carpeta de conocimiento, con consultas por significado (RAG) desde una app web. Embeddings con EmbeddingGemma 2, respuestas con un modelo local o en la nube.
 
 Sube PDFs y chatea con ellos. Las respuestas salen solo del contenido de los
 documentos y se muestra la fuente (archivo y página). Todo corre en tu
@@ -61,6 +63,55 @@ Abre http://localhost:8501. La API crea las tablas sola al iniciar.
 - **Imágenes del PDF:** «¿cuántas imágenes trae el PDF?» se contesta leyendo el archivo (sin IA),
   con las páginas que las tienen y las páginas que son un escaneo completo. Qué muestra una imagen
   (un perro, una planta...) **todavía no se puede saber**: haría falta un modelo de visión.
+- **Conversar con audios y videos (Whisper local):** al subir un audio o un video suelto (o ponerlo en la
+  carpeta `conocimiento/`), además de sus vectores con EmbeddingGemma 2 se **transcribe lo que se dice**
+  con Whisper (`openai/whisper-base`, ~0,7 s de cálculo por segundo de audio en un Core i5 de 8.ª gen; con
+  `WHISPER_MODEL=openai/whisper-small` es más exacto pero ~4 veces más lento). El texto entra como
+  fragmentos con su minuto de inicio, igual que un PDF: se puede preguntar, pedir resumen, puntos clave y
+  glosario, y las respuestas citan «archivo, minuto 2:35» con un botón «▶ Reproducir desde…». Una pregunta
+  que pide *encontrar* un audio o video («¿hay un audio donde hablen de…?») usa la búsqueda por
+  significado; una que pregunta *qué dice* («¿qué dice el audio sobre…?») usa el texto transcrito. Límites:
+  no se transcriben los audios adjuntos dentro de un PDF; un video se entiende por lo que se dice (su
+  imagen solo se busca por significado, no se describe); Whisper puede equivocarse con ruido o voces
+  superpuestas.
+- **Quién escribe las respuestas (local o nube):** selector en la barra lateral. *Ollama* (`qwen2.5:1.5b`) o
+  *llama.cpp* (el mismo modelo, ejecutado directamente con `llama-server`, que arranca solo al elegirlo
+  y usa el GGUF que Ollama ya descargó) corren en el computador; *Gemini* (`GEMINI_CHAT_MODEL`, por API y
+  con las claves ya configuradas) responde desde la nube, enviando a Google la pregunta y los fragmentos.
+  llama.cpp: descomprimir `llama-bXXXX-bin-win-cpu-x64.zip` (github.com/ggml-org/llama.cpp/releases) en
+  `llama.cpp/`.
+- **Preguntas sobre lo que muestra una imagen:** «¿qué muestra la imagen de la página 3?», «describe la
+  figura 1». Un modelo con visión (Gemini, en la nube) mira las imágenes indexadas de esa página (o las más
+  parecidas a la pregunta) y responde; se avisa que esas imágenes se enviaron a Google. Probado: describió
+  correctamente una ilustración de un perro. Con modelos solo locales no hay visión.
+- **Imágenes, audio y video con EmbeddingGemma 2 (local):** siguiendo «EmbeddingGemma 2: The Developer Guide»
+  (modelo `google/embeddinggemma-2`, sentence-transformers ≥ 6.1), texto, imágenes, audio y video se
+  convierten en vectores de 768 números en un mismo espacio, así que una frase puede buscar cualquiera
+  de ellos. Los audios y videos se parten en segmentos de 30 s (el video, 1 fotograma cada 5 s) y cada
+  resultado dice desde qué segundo empieza. Entran por tres caminos: audios o videos **adjuntos dentro de
+  un PDF**, **subidos sueltos** (mp3, wav, m4a, mp4, webm...) o desde la **carpeta de conocimiento**
+  (`conocimiento/`, botón «📂 Indexar carpeta»). Se elige el modelo en la barra lateral (EmbeddingGemma 2
+  o Gemini, este último solo imágenes). Pruebas con voz sintética y videos de ilustraciones:
+  «energía solar» → audio solar 0,79; «un perro» → audio de perros 0,76 y video del perro 0,69; lo que no
+  existe («cocina italiana») queda en 0,58, por debajo del mínimo (audio 0,69, video 0,665, imagen 0,655).
+  Límites honestos: compara significado, **no transcribe** el audio ni describe el video; los umbrales se
+  calibraron con pocos ejemplos; el video es lento (≈6 s por fotograma en CPU); el modelo completo gasta
+  ~4 GB de RAM. Se carga en float32 porque en este CPU el formato por defecto era ~8 veces más lento.
+- **Ver la base de datos en la web:** hay dos formas. (1) Página «Base de datos» dentro de la app
+  (menú de páginas de Streamlit): tablas con su tamaño, índices (hnsw para vectores, gin para palabras),
+  tus documentos con el modelo de embeddings de cada uno, una muestra de cada tabla y un cuadro de
+  consultas SQL de solo lectura. (2) Adminer, en http://localhost:8080 (`docker compose up -d`): sistema
+  PostgreSQL, servidor `db`, usuario `postgres`, clave `1234`, base `rag`. Ojo: Adminer sí puede ver
+  la tabla de claves de Gemini guardadas desde la interfaz; la página de la app la oculta.
+- **Elegir los embeddings del texto (Ollama o Gemini):** en la barra lateral, el interruptor
+  «☁️ Embeddings con Gemini al subir PDFs» decide con qué modelo se calculan los vectores de los PDFs
+  que subas **desde ese momento**. Cada PDF recuerda su modelo (se marca con ☁️ si fue Gemini) y, al
+  preguntar, la pregunta se convierte en vector con el mismo modelo del documento donde se busca.
+  La respuesta siempre la escribe Ollama (local). Medido con la guía de 8 páginas: 39 s con Ollama
+  contra 3 s con Gemini; en cambio cada pregunta tarda ~0,5 s más (va por internet). Con Gemini el
+  texto de los PDFs se envía a Google. Si Gemini falla al subir, se usa Ollama y se avisa.
+  Las claves también se pueden pegar desde la barra lateral (se guardan en la base de datos y
+  nunca se muestran; tienen prioridad sobre las del `.env`).
 - **Varias claves de Gemini:** puedes poner hasta 3 (`GEMINI_API_KEY`, `GEMINI_API_KEY_2`,
   `GEMINI_API_KEY_3`). Se usan en orden; si una llega a su límite de uso (queda en pausa ~1 min, o ~1 h
   si se repite) o es rechazada, el sistema pasa solo a la siguiente y **te avisa** en la respuesta.

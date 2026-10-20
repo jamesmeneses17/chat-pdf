@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Annotated
 from urllib.parse import quote, unquote
@@ -16,11 +17,13 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, Upl
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import busqueda_imagenes, config, db, exportar, gemini
+from app import (busqueda_imagenes, config, db, embeddings, exportar, gemini, llamacpp, llm, medios,
+                 vista_db)
 from app.citas import fragmentos_citados
 from app.imagen_chat import MAX_BYTES as MAX_BYTES_IMAGEN
 from app.imagen_chat import leer_texto_de_imagen
-from app.imagenes import analizar_imagenes, es_pregunta_de_imagenes, pide_contenido_de_imagen
+from app.imagenes import (analizar_imagenes, es_pregunta_de_imagenes, pagina_pedida, pide_audio_o_video,
+                          pide_contenido_de_imagen, pide_descripcion_de_imagen)
 from app.imagenes import describir as describir_imagenes
 from app.ingest import IngestaError, ingerir_pdf
 from app.llm import (generar_respuesta, generar_respuesta_stream, info_modelos,
@@ -39,9 +42,10 @@ async def lifespan(app: FastAPI):
     # Al iniciar la API se crean las tablas si no existen (y se migran las antiguas)
     db.crear_tablas()
     yield
+    llamacpp.detener()  # si esta aplicación arrancó llama-server, lo cierra y libera la memoria
 
 
-app = FastAPI(title="Chat con PDFs", lifespan=lifespan)
+app = FastAPI(title="Base de Conocimiento IA", lifespan=lifespan)
 log = logging.getLogger("uvicorn.error")  # así los mensajes salen en la consola de uvicorn
 
 
@@ -73,10 +77,20 @@ class MensajeNuevo(BaseModel):
     extra: dict = {}
 
 
+def minutos(segundos) -> str:
+    s = int(segundos or 0)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def donde_esta(f: dict) -> str:
+    """'página 3' para un PDF, 'minuto 2:35' para un audio o video."""
+    return f"minuto {minutos(f['inicio'])}" if f.get("inicio") is not None else f"página {f['pagina']}"
+
+
 def construir_prompt(pregunta: str, fragmentos: list[dict], historial: list[dict] | None = None) -> str:
     """Arma el prompt: instrucciones + historial + contexto numerado + pregunta."""
     contexto = "\n\n".join(
-        f"[{f['n']}] ({f['documento']}, página {f['pagina']})\n{f['contenido']}" for f in fragmentos
+        f"[{f['n']}] ({f['documento']}, {donde_esta(f)})\n{f['contenido']}" for f in fragmentos
     )
     bloque_historial = ""
     if historial:
@@ -132,6 +146,61 @@ def preparar_consulta(datos: PreguntaChat, usuario: str, tiempos: dict):
     return interpretada, fragmentos, prompt
 
 
+def modelo_de_respuesta_con_imagenes(pregunta: str) -> str:
+    """Qué hizo la respuesta: describir una imagen usa un modelo con visión; lo demás es leer / buscar."""
+    if pide_descripcion_de_imagen(pregunta):
+        return f"{config.GEMINI_CHAT_MODEL} (nube, visión)"
+    return "lectura del PDF (sin IA)"
+
+
+def respuesta_viendo_imagenes(datos: PreguntaChat, usuario: str, nombres: list[str]):
+    """Contesta una pregunta sobre lo que MUESTRA una imagen, usando un modelo con visión (Gemini, en la nube).
+
+    Elige las imágenes de la página que se nombra o, si no se nombra ninguna, las más parecidas a la pregunta.
+    """
+    pagina = pagina_pedida(datos.pregunta)
+    imagenes = db.imagenes_de_documentos(usuario, nombres, pagina, 3)
+    if not pagina and len(imagenes) > 1:  # sin página: las más parecidas a lo que se pregunta
+        try:
+            coinciden, candidatas = busqueda_imagenes.buscar(usuario, datos.pregunta, nombres, ("imagen",))
+            ids = [c["id"] for c in (coinciden or candidatas)[:2]]
+            imagenes = [i for i in db.imagenes_de_documentos(usuario, nombres, None, 50) if i["id"] in ids] or imagenes
+        except RuntimeError:
+            pass
+    if not imagenes:
+        return ("No tengo imágenes indexadas" + (f" en la página {pagina}" if pagina else "") +
+                " de los documentos elegidos. Usa el botón «🖼️ Indexar imágenes, audio y video» bajo el visor.", [], [])
+    if not gemini.disponible():
+        return ("Para decir qué muestra una imagen hace falta un modelo con visión, y no hay ninguna clave de "
+                "Gemini disponible. " + gemini.mensaje_sin_claves(), [], [])
+    # El texto cercano ayuda al modelo a entender la figura (pie de foto, explicación)
+    contexto = ""
+    try:
+        cercanos = [f for f in buscar_similares(datos.pregunta, usuario, nombres)
+                    if not pagina or f["pagina"] == pagina][:2]
+        contexto = "\n".join(f"- {f['contenido']}" for f in cercanos)
+    except RuntimeError:
+        pass
+    prompt = ("Responde en español, de forma breve, usando lo que ves en la(s) imagen(es) adjunta(s)"
+              + (f" y este texto del documento:\n{contexto}\n" if contexto else ".") +
+              f"\n\nPregunta: {datos.pregunta}")
+    try:
+        respuesta = gemini.generar(prompt, [i["png"] for i in imagenes], maximo=600)
+    except RuntimeError as e:
+        return f"No pude consultar el modelo con visión: {e}", [], []
+    origen = ", ".join(sorted({f"{i['documento']} pág. {i['pagina']}" for i in imagenes}))
+    texto = (f"{respuesta}\n\n*Imágenes vistas por {config.GEMINI_CHAT_MODEL} (nube): {origen}. "
+             "Se enviaron a Google para poder verlas.*")
+    avisos = gemini.pop_avisos()
+    if avisos:
+        texto += "\n\n⚠️ " + " ".join(avisos)
+    detalle = [{"n": n, "documento": i["documento"], "pagina": i["pagina"], "pasajes": [],
+                "titulo": "Imagen analizada"} for n, i in enumerate(imagenes, 1)]
+    mostradas = [{"id": i["id"], "documento": i["documento"], "pagina": i["pagina"], "similitud": 1.0,
+                  "tipo": "imagen"} for i in imagenes]
+    return texto, detalle, mostradas
+
+
 def respuesta_sobre_imagenes(datos: PreguntaChat, usuario: str) -> tuple[str, list[dict], list[dict]]:
     """Responde sobre las imágenes del PDF. Cuenta leyendo el archivo (sin IA) y, si preguntan qué
     muestran ("¿hay un perro?"), busca las más parecidas con Gemini cuando hay clave.
@@ -142,8 +211,15 @@ def respuesta_sobre_imagenes(datos: PreguntaChat, usuario: str) -> tuple[str, li
         d["nombre"] for d in db.listar_documentos(usuario)]
     if not nombres:
         return "No hay documentos cargados todavía.", [], []
+    if pide_descripcion_de_imagen(datos.pregunta):
+        return respuesta_viendo_imagenes(datos, usuario, nombres)
     partes, detalle = [], []
+    sueltos = {d["nombre"] for d in db.listar_documentos(usuario) if d["tipo"] != "pdf"}  # audios y videos sueltos
+    solo_audio_video = pide_audio_o_video(datos.pregunta) and not re.search(
+        r"im[aá]gen|foto|figura|ilustraci|gr[aá]fico", datos.pregunta, re.I)
     for nombre in nombres:
+        if nombre in sueltos or solo_audio_video:
+            continue  # no son PDFs con imágenes que contar
         pdf = db.obtener_pdf(usuario, nombre)
         if pdf is None:
             partes.append(f"**{nombre}**: no tiene el original guardado (bórralo y vuelve a subirlo).")
@@ -157,33 +233,33 @@ def respuesta_sobre_imagenes(datos: PreguntaChat, usuario: str) -> tuple[str, li
     texto = "\n\n".join(partes)
     encontradas: list[dict] = []
     if pide_contenido_de_imagen(datos.pregunta):
-        if not gemini.disponible():
-            texto += ("\n\nPuedo contar y ubicar las imágenes, pero **no puedo saber qué muestran** "
-                      f"(por ejemplo, si hay un perro o una planta). {gemini.mensaje_sin_claves()}")
-        else:
-            tema = busqueda_imagenes.tema_de_la_pregunta(datos.pregunta)
-            try:
-                encontradas, candidatas = busqueda_imagenes.buscar(usuario, tema, datos.documentos)
-            except RuntimeError as e:
-                encontradas = []
-                texto += f"\n\nNo pude buscar en las imágenes: {e}"
+        tema = busqueda_imagenes.tema_de_la_pregunta(datos.pregunta)
+        tipos = busqueda_imagenes.tipos_pedidos(datos.pregunta)
+        que = " / ".join({"imagen": "imágenes", "audio": "audios", "video": "videos"}[t] for t in tipos)
+        try:
+            encontradas, candidatas = busqueda_imagenes.buscar(usuario, tema, datos.documentos, tipos)
+        except RuntimeError as e:
+            candidatas, encontradas = None, []
+            texto += f"\n\nNo pude buscar en {que}: {e}"
+        if candidatas is not None:
+            if not candidatas:
+                texto += (f"\n\nNo hay {que} indexados para buscar. Sube el archivo de nuevo o usa el botón "
+                          "«🖼️ Indexar imágenes, audio y video» bajo el visor.")
+            elif not encontradas:
+                mejor = candidatas[0]
+                donde = f"pág. {mejor['pagina']} de {mejor['documento']}" if mejor["pagina"] else mejor["documento"]
+                minimo = config.UMBRALES.get(mejor["proveedor"], {}).get(mejor["tipo"], (0, 0))[0]
+                texto += (f"\n\n**No encontré nada ({que}) que se parezca a «{tema}»** con suficiente "
+                          f"seguridad. Lo más cercano fue {mejor['tipo']} de {donde}, con "
+                          f"{mejor['similitud'] * 100:.0f} % de parecido (el mínimo para aceptarlo es "
+                          f"{minimo * 100:.1f} %).")
             else:
-                if not candidatas:
-                    texto += ("\n\nNo hay imágenes indexadas para buscar. Súbelo de nuevo o usa el botón "
-                              "«🖼️ Indexar imágenes» bajo el visor.")
-                elif not encontradas:
-                    mejor = candidatas[0]
-                    texto += (f"\n\n**No encontré ninguna imagen que se parezca a «{tema}»** con suficiente "
-                              f"seguridad. La más cercana fue la de la pág. {mejor['pagina']} de "
-                              f"{mejor['documento']}, con {mejor['similitud'] * 100:.0f} % de parecido "
-                              f"(el mínimo para aceptarla es {config.IMAGENES_MIN_SIM * 100:.1f} %).")
-                else:
-                    cuantas = "esta imagen" if len(encontradas) == 1 else f"estas {len(encontradas)} imágenes"
-                    texto += (f"\n\nEncontré {cuantas} que se parece{'' if len(encontradas) == 1 else 'n'} "
-                              f"a «{tema}». El parecido es una estimación, confírmalo mirando la imagen.")
-                    detalle = [{"n": i + 1, "documento": e["documento"], "pagina": e["pagina"],
-                                "pasajes": [], "titulo": f"Imagen parecida a «{tema}»"}
-                               for i, e in enumerate(encontradas)]
+                texto += (f"\n\nEncontré {len(encontradas)} resultado(s) que se parecen a «{tema}». El parecido "
+                          "es una estimación, confírmalo viéndolo o escuchándolo. Para preguntar qué dicen, "
+                          "hazlo sin pedir «un audio…» (por ejemplo: «¿qué dice el audio sobre perros?»).")
+                detalle = [{"n": i + 1, "documento": e["documento"], "pagina": e["pagina"],
+                            "pasajes": [], "titulo": f"Imagen parecida a «{tema}»"}
+                           for i, e in enumerate(encontradas) if e["tipo"] == "imagen" and e["pagina"]]
     avisos = gemini.pop_avisos()  # si hubo que cambiar de clave o una llegó a su límite
     if avisos:
         texto += "\n\n⚠️ " + " ".join(avisos)
@@ -213,7 +289,7 @@ def sin_etiqueta_marcada(trozos):
 def detalle_de_citas(respuesta: str, pregunta: str, fragmentos: list[dict],
                      citas: list[int]) -> list[dict]:
     """Por cada fragmento citado: documento, página y los pasajes exactos que hay que resaltar."""
-    return [{"n": f["n"], "documento": f["documento"], "pagina": f["pagina"],
+    return [{"n": f["n"], "documento": f["documento"], "pagina": f["pagina"], "inicio": f.get("inicio"),
              "pasajes": pasajes_de_respuesta(respuesta, pregunta, f["contenido"])}
             for f in fragmentos if f["n"] in citas]
 
@@ -221,7 +297,7 @@ def detalle_de_citas(respuesta: str, pregunta: str, fragmentos: list[dict],
 def lista_de_fuentes(fragmentos: list[dict]) -> list[dict]:
     """Fuentes para mostrar: número, documento, página, texto completo y por qué se eligió."""
     return [{
-        "n": f["n"], "documento": f["documento"], "pagina": f["pagina"],
+        "n": f["n"], "documento": f["documento"], "pagina": f["pagina"], "inicio": f.get("inicio"),
         "fragmento": f["contenido"],  # el texto completo del fragmento
         "id": f.get("id"), "posicion": f.get("posicion"), "total_documento": f.get("total_documento"),
         "similitud": round(f.get("similitud", 0), 3),  # parecido por significado (vectores)
@@ -234,27 +310,53 @@ def lista_de_fuentes(fragmentos: list[dict]) -> list[dict]:
 @app.post("/subir")
 async def subir(usuario: Usuario, archivo: UploadFile = File(...)):
     contenido = await archivo.read()
+    return procesar_subida(usuario, archivo.filename, contenido)
+
+
+def procesar_subida(usuario: str, nombre: str, contenido: bytes) -> dict:
+    """Indexa un archivo (PDF, audio o video). Lo usan la subida manual y la carpeta de conocimiento."""
     inicio = time.perf_counter()
+    tipo_medio = medios.tipo_de_archivo(nombre)
+    if tipo_medio:  # un audio o video suelto: se indexa por segmentos con EmbeddingGemma 2
+        try:
+            r = busqueda_imagenes.indexar_archivo_suelto(usuario, nombre, contenido)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"No se pudo indexar el {tipo_medio}: {e}")
+        mensaje = (f"'{nombre}' indexado: {r['segmentos']} segmento(s) de {tipo_medio} (EmbeddingGemma 2); "
+                   f"se transcribieron {r['palabras']} palabras en {r['fragmentos']} fragmento(s).")
+        avisos = [r["aviso_embeddings"]] if r.get("aviso_embeddings") else []
+        if not r["fragmentos"]:
+            avisos.append("No se oyó ninguna voz en el archivo: se puede buscar por su sonido o imagen, "
+                          "pero no hay texto para conversar con él.")
+        return {"mensaje": mensaje, "advertencias": avisos}
     try:
-        r = ingerir_pdf(usuario, archivo.filename, contenido)
+        r = ingerir_pdf(usuario, nombre, contenido)
     except IngestaError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:  # errores de Ollama
         raise HTTPException(status_code=503, detail=str(e))
 
-    mensaje = f"'{archivo.filename}' indexado: {r['fragmentos']} fragmentos."
+    mensaje = f"'{nombre}' indexado: {r['fragmentos']} fragmentos (embeddings: {r['proveedor']})."
     advertencias = []
+    if r.get("aviso_embeddings"):
+        advertencias.append(r["aviso_embeddings"])
     if r["ocr"]:
         mensaje += f" Se usó OCR en {len(r['ocr'])} página(s)."
     if r.get("marcadas"):
         mensaje += f" Se detectaron {r['marcadas']} casillas marcadas (detección aproximada)."
-    if gemini.disponible():  # las imágenes del PDF se indexan con Gemini (nube) para poder buscarlas
+    if True:  # imágenes (y audios / videos adjuntos) del PDF: se indexan para poder buscarlos con una frase
         try:
-            im = busqueda_imagenes.indexar(usuario, archivo.filename, contenido)
-        except Exception:
-            im = {"indexadas": 0, "total": 0, "error": "No se pudieron indexar las imágenes."}
+            im = busqueda_imagenes.indexar(usuario, nombre, contenido)
+        except Exception as e:
+            im = {"indexadas": 0, "total": 0, "audios": 0, "videos": 0, "proveedor": "?",
+                  "error": f"No se pudieron indexar las imágenes ({e})."}
+        modelo = {"gemma2": "EmbeddingGemma 2", "gemini": "Gemini"}.get(im["proveedor"], im["proveedor"])
         if im["indexadas"]:
-            mensaje += f" Se indexaron {im['indexadas']} imágenes con Gemini."
+            mensaje += f" Se indexaron {im['indexadas']} imágenes con {modelo}."
+        if im.get("audios") or im.get("videos"):
+            mensaje += f" Audios adjuntos: {im['audios']}, videos adjuntos: {im['videos']}."
         if im["error"]:
             advertencias.append(f"Imágenes: {im['error']} (indexadas {im['indexadas']} de {im['total']}).")
         advertencias += [f"Gemini: {a}" for a in gemini.pop_avisos()]  # cambios de clave, límites...
@@ -265,7 +367,7 @@ async def subir(usuario: Usuario, archivo: UploadFile = File(...)):
             "con mucho ruido). Las respuestas sobre esas páginas pueden ser imprecisas."
         )
     log.info("SUBIDA '%s' (usuario %s): %d fragmentos, OCR en %d pág., en %d ms",
-             archivo.filename, usuario, r["fragmentos"], len(r["ocr"]),
+             nombre, usuario, r["fragmentos"], len(r["ocr"]),
              round((time.perf_counter() - inicio) * 1000))
     return {"mensaje": mensaje, "advertencias": advertencias}
 
@@ -273,6 +375,55 @@ async def subir(usuario: Usuario, archivo: UploadFile = File(...)):
 @app.get("/documentos")
 def documentos(usuario: Usuario):
     return db.listar_documentos(usuario)
+
+
+@app.get("/documentos/{nombre}/archivo_medio")
+def ver_medio_suelto(nombre: str, usuario: Usuario):
+    """El audio o video de un documento suelto, para reproducirlo en el visor."""
+    medio = db.obtener_adjunto_de_documento(usuario, nombre)
+    if medio is None:
+        raise HTTPException(status_code=404, detail="Ese documento no es un audio ni un video.")
+    return Response(content=medio[2], media_type=medio[1])
+
+
+# ------------------------------------------------ carpeta de conocimiento (PDFs, audios y videos)
+def _carpeta() -> Path:
+    ruta = Path(config.CARPETA_CONOCIMIENTO)
+    return ruta if ruta.is_absolute() else Path(__file__).resolve().parent.parent / ruta
+
+
+def _archivos_de_la_carpeta() -> list[Path]:
+    carpeta = _carpeta()
+    if not carpeta.is_dir():
+        return []
+    return sorted(p for p in carpeta.iterdir()
+                  if p.is_file() and (p.suffix.lower() == ".pdf" or medios.tipo_de_archivo(p.name)))
+
+
+@app.get("/carpeta")
+def estado_de_la_carpeta(usuario: Usuario):
+    """Qué archivos hay en la carpeta de conocimiento y cuáles faltan por indexar."""
+    ya = {d["nombre"] for d in db.listar_documentos(usuario)}
+    archivos = [{"nombre": p.name, "indexado": p.name in ya, "kb": p.stat().st_size // 1024}
+                for p in _archivos_de_la_carpeta()]
+    return {"carpeta": str(_carpeta()), "existe": _carpeta().is_dir(), "archivos": archivos}
+
+
+@app.post("/carpeta/indexar")
+def indexar_la_carpeta(usuario: Usuario):
+    """Indexa los PDFs, audios y videos de la carpeta de conocimiento que el usuario aún no tiene."""
+    ya = {d["nombre"] for d in db.listar_documentos(usuario)}
+    resultados = []
+    for ruta in _archivos_de_la_carpeta():
+        if ruta.name in ya:
+            continue
+        try:
+            r = procesar_subida(usuario, ruta.name, ruta.read_bytes())
+            resultados.append({"nombre": ruta.name, "ok": True, "mensaje": r["mensaje"],
+                               "advertencias": r["advertencias"]})
+        except HTTPException as e:
+            resultados.append({"nombre": ruta.name, "ok": False, "mensaje": str(e.detail), "advertencias": []})
+    return {"carpeta": str(_carpeta()), "resultados": resultados}
 
 
 @app.get("/documentos/{nombre}/pdf")
@@ -319,16 +470,16 @@ def resaltar(nombre: str, pedido: PedidoResaltado, usuario: Usuario):
 
 @app.post("/documentos/{nombre}/indexar_imagenes")
 def indexar_imagenes_del_documento(nombre: str, usuario: Usuario):
-    """Envía las imágenes de un documento ya subido a Gemini para poder buscarlas."""
-    if not gemini.disponible():
+    """Indexa las imágenes (y audios / videos adjuntos) de un documento ya subido para poder buscarlos."""
+    if embeddings.proveedor_medios() == "gemini" and not gemini.disponible():
         raise HTTPException(status_code=400, detail=gemini.mensaje_sin_claves())
     contenido = db.obtener_pdf(usuario, nombre)
     if contenido is None:
         raise HTTPException(status_code=404, detail="El PDF original no está guardado.")
     try:
         resultado = busqueda_imagenes.indexar(usuario, nombre, contenido)
-    except Exception:
-        raise HTTPException(status_code=503, detail="No se pudieron indexar las imágenes.")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"No se pudieron indexar las imágenes: {e}")
     resultado["avisos"] = gemini.pop_avisos()
     return resultado
 
@@ -337,10 +488,44 @@ class EstadoClave(BaseModel):
     activa: bool
 
 
+class ClaveNueva(BaseModel):
+    clave: str
+
+
+class ProveedorEmbeddings(BaseModel):
+    proveedor: str
+
+
 @app.get("/gemini/claves")
 def claves_de_gemini():
     """Estado de las 3 claves de Gemini (sin mostrar las claves)."""
     return {"claves": gemini.estado_claves()}
+
+
+@app.put("/gemini/claves/{numero}/clave")
+def guardar_clave_de_gemini(numero: int, nueva: ClaveNueva):
+    """Guarda la clave pegada en la interfaz (vacía = borrarla). Nunca se devuelve la clave."""
+    try:
+        gemini.guardar_clave(numero, nueva.clave)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"claves": gemini.estado_claves()}
+
+
+@app.get("/embeddings")
+def modelo_de_embeddings():
+    """Con qué modelo se calculan los vectores de los PDFs que se suban ahora."""
+    return {"proveedor": embeddings.proveedor_actual(), "gemini_disponible": gemini.disponible()}
+
+
+@app.post("/embeddings")
+def elegir_modelo_de_embeddings(eleccion: ProveedorEmbeddings):
+    if eleccion.proveedor not in embeddings.PROVEEDORES:
+        raise HTTPException(status_code=400, detail=f"El proveedor debe ser uno de: {', '.join(embeddings.PROVEEDORES)}.")
+    if eleccion.proveedor == "gemini" and not gemini.disponible():
+        raise HTTPException(status_code=400, detail=gemini.mensaje_sin_claves())
+    embeddings.fijar_proveedor(eleccion.proveedor)
+    return {"proveedor": eleccion.proveedor, "gemini_disponible": gemini.disponible()}
 
 
 @app.post("/gemini/claves/{numero}")
@@ -359,6 +544,55 @@ def ver_imagen(imagen_id: int, usuario: Usuario):
     if png is None:
         raise HTTPException(status_code=404, detail="Imagen no encontrada.")
     return Response(content=png, media_type="image/png")
+
+
+@app.get("/medios/{imagen_id}/archivo")
+def ver_archivo_de_medio(imagen_id: int, usuario: Usuario):
+    """El audio o video original al que pertenece un segmento encontrado (para reproducirlo en el chat)."""
+    adjunto = db.obtener_adjunto(usuario, imagen_id)
+    if adjunto is None:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado.")
+    return Response(content=adjunto[1], media_type=adjunto[0])
+
+
+@app.get("/chat/modelo")
+def modelo_de_chat():
+    """Quién escribe las respuestas: el modelo local (Ollama) o uno de la nube (Gemini)."""
+    return {"proveedor": llm.proveedor_chat(), "opciones": list(llm.PROVEEDORES_CHAT),
+            "gemini_disponible": gemini.disponible(), "modelo_nube": config.GEMINI_CHAT_MODEL,
+            "modelo_local": config.CHAT_MODEL, "llamacpp_listo": llamacpp.ruta_servidor().is_file()
+            and llamacpp.ruta_modelo() is not None, "llamacpp_activo": llamacpp.servidor_activo()}
+
+
+@app.post("/chat/modelo")
+def elegir_modelo_de_chat(eleccion: ProveedorEmbeddings):
+    if eleccion.proveedor == "gemini" and not gemini.disponible():
+        raise HTTPException(status_code=400, detail=gemini.mensaje_sin_claves())
+    if eleccion.proveedor == "llamacpp":
+        try:
+            llamacpp.iniciar()  # arranca llama-server si hace falta (tarda unos segundos en cargar el modelo)
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    try:
+        llm.fijar_proveedor_chat(eleccion.proveedor)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return modelo_de_chat()
+
+
+@app.get("/embeddings/medios")
+def modelo_de_medios():
+    """Con qué modelo se calculan los vectores de imágenes, audios y videos nuevos."""
+    return {"proveedor": embeddings.proveedor_medios(), "opciones": list(embeddings.MEDIOS)}
+
+
+@app.post("/embeddings/medios")
+def elegir_modelo_de_medios(eleccion: ProveedorEmbeddings):
+    try:
+        embeddings.fijar_proveedor_medios(eleccion.proveedor)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"proveedor": eleccion.proveedor, "opciones": list(embeddings.MEDIOS)}
 
 
 @app.get("/documentos/{nombre}/giros")
@@ -425,7 +659,14 @@ def crear_resumen_stream(nombre: str, usuario: Usuario):
                 yield json.dumps({"texto": trozo}) + "\n"
             # Cuánto del documento vio el modelo (un fragmento por página) y si inventó cifras
             texto_leido, cobertura = muestra_del_documento(usuario, nombre)
-            cobertura["cifras_sin_respaldo"] = cifras_sin_respaldo("".join(partes), texto_leido)
+            resumen = "".join(partes)
+            cobertura["cifras_sin_respaldo"] = cifras_sin_respaldo(resumen, texto_leido)
+            textos = cobertura.pop("textos")
+            # Por cada página leída, los pasajes que respaldan lo escrito (para pintarlos de amarillo en el PDF)
+            detalle = [{"n": i, "documento": nombre, "pagina": pagina, "titulo": "Fuente del resumen",
+                        "pasajes": pasajes_de_respuesta(resumen, "", texto)}
+                       for i, (pagina, texto) in enumerate(sorted(textos.items()), 1)]
+            cobertura["detalle"] = [d for d in detalle if d["pasajes"]]
             yield json.dumps({"cobertura": cobertura}) + "\n"
             log.info("RESUMEN (stream) de '%s' generado en %d ms",
                      nombre, round((time.perf_counter() - inicio) * 1000))
@@ -460,7 +701,7 @@ def chat(datos: PreguntaChat, usuario: Usuario):
     inicio = time.perf_counter()
     if es_pregunta_de_imagenes(datos.pregunta):  # se contesta leyendo el PDF, sin modelo de chat
         texto, detalle, imagenes = respuesta_sobre_imagenes(datos, usuario)
-        return {"respuesta": texto, "fuentes": [], "modelo": "lectura del PDF (sin IA)",
+        return {"respuesta": texto, "fuentes": [], "modelo": modelo_de_respuesta_con_imagenes(datos.pregunta),
                 "citas": [], "citas_detalle": detalle, "imagenes": imagenes,
                 "pregunta_interpretada": datos.pregunta}
     try:
@@ -502,7 +743,7 @@ def chat_stream(datos: PreguntaChat, usuario: Usuario):
                 yield json.dumps({"fuentes": [], "pregunta_interpretada": datos.pregunta}) + "\n"
                 yield json.dumps({"texto": texto}) + "\n"
                 tiempos["total_ms"] = round((time.perf_counter() - inicio) * 1000)
-                yield json.dumps({"tiempos": tiempos, "modelo": "lectura del PDF (sin IA)",
+                yield json.dumps({"tiempos": tiempos, "modelo": modelo_de_respuesta_con_imagenes(datos.pregunta),
                                   "citas": [], "citas_detalle": detalle, "imagenes": imagenes}) + "\n"
                 return
             interpretada, fragmentos, prompt = preparar_consulta(datos, usuario, tiempos)
@@ -620,6 +861,36 @@ def exportar_chat(conversacion_id: int, usuario: Usuario, formato: str = "pdf"):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return _archivo(archivo, bloques, formato)
+
+
+# ------------------------------------------------- ver la base de datos (solo lectura)
+class ConsultaSQL(BaseModel):
+    sql: str
+
+
+@app.get("/db/resumen")
+def db_resumen(usuario: Usuario):
+    """Versión de PostgreSQL, tablas con su tamaño, índices y los documentos del usuario."""
+    return vista_db.resumen(usuario)
+
+
+@app.get("/db/muestra/{tabla}")
+def db_muestra(tabla: str, usuario: Usuario, n: int = 10):
+    try:
+        return vista_db.muestra(tabla, n)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/db/consulta")
+def db_consulta(consulta: ConsultaSQL, usuario: Usuario):
+    """Ejecuta una consulta de solo lectura (SELECT / EXPLAIN)."""
+    try:
+        return vista_db.consulta(consulta.sql)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # error de SQL: se muestra el mensaje de PostgreSQL
+        raise HTTPException(status_code=400, detail=f"PostgreSQL: {str(e).splitlines()[0]}")
 
 
 @app.get("/estado")

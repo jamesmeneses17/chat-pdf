@@ -24,13 +24,33 @@ PAUSA_LARGA = 3600  # si llega al límite 3 veces seguidas, es probable que sea 
 
 _estado: dict[int, dict] = {}  # estado de cada clave mientras corre la API
 _activas: dict[int, bool] | None = None  # qué claves están encendidas (se guarda en la base)
+_guardadas: dict[int, str] | None = None  # claves pegadas desde la interfaz (tienen prioridad sobre el .env)
 _avisos: list[str] = []  # lo que pasó con las claves, para decírselo al usuario
 
 
 # ------------------------------------------------------------------ estado de las claves
 def _claves() -> list[tuple[int, str]]:
-    """Las claves configuradas en el .env, como (número, clave)."""
-    return [(n, k) for n, k in config.GEMINI_CLAVES if k]
+    """Las claves configuradas (de la interfaz o del .env), como (número, clave)."""
+    global _guardadas
+    if _guardadas is None:
+        try:
+            _guardadas = db.claves_gemini_guardadas()
+        except Exception:
+            _guardadas = {}
+    return [(n, _guardadas.get(n) or k) for n, k in config.GEMINI_CLAVES if _guardadas.get(n) or k]
+
+
+def guardar_clave(numero: int, clave: str):
+    """Guarda la clave que se pegó en la interfaz (vacía = borrarla; entonces vale la del .env, si hay)."""
+    global _guardadas
+    if numero not in (1, 2, 3):
+        raise ValueError("La clave debe ser 1, 2 o 3.")
+    clave = clave.strip()
+    if clave and (len(clave) < 20 or any(c.isspace() for c in clave)):
+        raise ValueError("Esa clave no parece válida: no debe tener espacios y suele tener unos 40 caracteres o más.")
+    db.guardar_clave_gemini(numero, clave)
+    _guardadas = None  # se vuelve a leer
+    _est(numero).update(bloqueada_hasta=0.0, invalida=False, seguidos_429=0, motivo="")
 
 
 def _est(numero: int) -> dict:
@@ -122,16 +142,12 @@ def _es_problema_de_la_clave(respuesta) -> bool:
     return respuesta.status_code in (401, 403) or "api key" in texto or "api_key" in texto
 
 
-def _embedding(partes: list[dict]) -> list[float]:
-    """Pide a Gemini el vector de un contenido (texto o imagen), probando las claves por orden."""
+def _pedir(metodo: str, cuerpo: dict, modelo: str | None = None) -> dict:
+    """Llama a Gemini probando las claves por orden. Devuelve el JSON de la respuesta."""
     claves = _claves()
     if not claves:
         raise RuntimeError(mensaje_sin_claves())
-    cuerpo = {
-        "model": f"models/{config.GEMINI_EMBED_MODEL}",
-        "content": {"parts": partes},
-        "output_dimensionality": config.GEMINI_DIM,
-    }
+    url = URL.format(modelo=modelo or config.GEMINI_EMBED_MODEL).replace(":embedContent", f":{metodo}")
     fallos: list[tuple[int, str]] = []  # claves que no sirvieron en esta petición
     for posicion, (numero, clave) in enumerate(claves):
         if not _usable(numero, time.time()):
@@ -140,8 +156,7 @@ def _embedding(partes: list[dict]) -> list[float]:
         cabeceras = {"x-goog-api-key": clave, "Content-Type": "application/json"}
         for intento in range(3):
             try:
-                respuesta = httpx.post(URL.format(modelo=config.GEMINI_EMBED_MODEL), headers=cabeceras,
-                                       json=cuerpo, timeout=60)
+                respuesta = httpx.post(url, headers=cabeceras, json=cuerpo, timeout=120)
             except httpx.HTTPError:
                 raise RuntimeError("No se pudo conectar con Gemini. ¿Hay conexión a internet?") from None
             # Con una sola clave disponible se espera un poco (límite por minuto); con otra de respaldo, se cambia
@@ -168,24 +183,68 @@ def _embedding(partes: list[dict]) -> list[float]:
                 continue
             raise RuntimeError(_error_de_estado(respuesta.status_code))
 
-        datos = respuesta.json()
-        # La respuesta trae el vector en 'embedding.values' (o 'embeddings[0].values')
-        vector = (datos.get("embedding") or {}).get("values") \
-            or ((datos.get("embeddings") or [{}])[0]).get("values")
-        if not vector or len(vector) != config.GEMINI_DIM:
-            raise RuntimeError("Gemini devolvió un vector inesperado (tamaño distinto al de GEMINI_DIM).")
         e["seguidos_429"] = 0
         e["usos"] += 1
         for fallida, motivo in fallos:  # si hubo que cambiar de clave, se avisa
             _avisos.append(f"La clave {fallida} {motivo}; se usó la clave {numero}.")
-        v = np.array(vector, dtype=float)
-        return (v / np.linalg.norm(v)).tolist()
+        return respuesta.json()
 
     for fallida, motivo in fallos:
         _avisos.append(f"La clave {fallida} {motivo}.")
     if fallos and all("no obtuvo respuesta" in motivo for _, motivo in fallos):
         raise RuntimeError("Gemini no respondió. Inténtalo de nuevo en un momento.")
     raise RuntimeError(mensaje_sin_claves())
+
+
+def _normalizado(vector) -> list[float]:
+    if not vector or len(vector) != config.GEMINI_DIM:
+        raise RuntimeError("Gemini devolvió un vector inesperado (tamaño distinto al de GEMINI_DIM).")
+    v = np.array(vector, dtype=float)
+    return (v / np.linalg.norm(v)).tolist()
+
+
+def _embedding(partes: list[dict]) -> list[float]:
+    """Vector de un contenido (texto o imagen)."""
+    datos = _pedir("embedContent", {
+        "model": f"models/{config.GEMINI_EMBED_MODEL}",
+        "content": {"parts": partes},
+        "output_dimensionality": config.GEMINI_DIM,
+    })
+    # La respuesta trae el vector en 'embedding.values' (o 'embeddings[0].values')
+    return _normalizado((datos.get("embedding") or {}).get("values")
+                        or ((datos.get("embeddings") or [{}])[0]).get("values"))
+
+
+def embeddings_documentos(textos: list[str], lote: int = 50) -> list[list[float]]:
+    """Vectores de muchos fragmentos de documento, varios por petición (mucho más rápido que uno a uno)."""
+    salida = []
+    for i in range(0, len(textos), lote):
+        pedidos = [{"model": f"models/{config.GEMINI_EMBED_MODEL}",
+                    "content": {"parts": [{"text": f"title: none | text: {t}"}]},
+                    "output_dimensionality": config.GEMINI_DIM} for t in textos[i:i + lote]]
+        datos = _pedir("batchEmbedContents", {"requests": pedidos})
+        vectores = [e.get("values") for e in datos.get("embeddings", [])]
+        if len(vectores) != len(pedidos):
+            raise RuntimeError("Gemini devolvió menos vectores de los pedidos.")
+        salida.extend(_normalizado(v) for v in vectores)
+    return salida
+
+
+def generar(prompt: str, imagenes: list[bytes] | None = None, maximo: int = 1024) -> str:
+    """Respuesta de un modelo de Gemini (nube). Puede recibir imágenes (PNG) para que las vea."""
+    partes = [{"text": prompt}] + [
+        {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(png).decode("ascii")}}
+        for png in imagenes or []]
+    datos = _pedir("generateContent", {
+        "contents": [{"role": "user", "parts": partes}],
+        "generationConfig": {"temperature": config.TEMPERATURE, "maxOutputTokens": maximo},
+    }, modelo=config.GEMINI_CHAT_MODEL)
+    candidatos = datos.get("candidates") or []
+    texto = "".join(p.get("text", "") for p in ((candidatos[0].get("content") or {}).get("parts") or [])) \
+        if candidatos else ""
+    if not texto.strip():
+        raise RuntimeError("Gemini no devolvió texto (puede que sus filtros bloquearan la respuesta).")
+    return texto.strip()
 
 
 def embedding_consulta(texto: str) -> list[float]:

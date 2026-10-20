@@ -52,6 +52,8 @@ def muestra_del_documento(usuario: str, nombre: str) -> tuple[str, dict]:
         "paginas_usadas": elegidas,
         "paginas_total": len(paginas),
         "porcentaje": round(100 * texto_usado / max(1, texto_total)),
+        # el texto exacto que el modelo leyó de cada página (para ubicar de dónde salió lo que escribió)
+        "textos": {p: _recortar(mejor_de_pagina[p], presupuesto) for p in elegidas},
     }
     return "\n\n".join(partes), cobertura
 

@@ -9,3 +9,12 @@ httpx
 python-dotenv
 numpy
 python-docx
+
+# EmbeddingGemma 2 (local, multimodal): texto, imagenes, audio y video
+torch
+sentence-transformers>=6.1.0
+transformers
+pillow
+av
+soundfile
+librosa

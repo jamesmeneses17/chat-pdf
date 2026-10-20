@@ -130,9 +130,40 @@ _PIDE_CONTENIDO = re.compile(
     rf"|\b{_IMAGEN}\s+(?:de|del|con)\s+(?!(?:un|una|unos|unas|el|la|los|las)\b)\w+", re.I)
 
 
+# Preguntas sobre audios y videos ("¿hay un audio donde hablen de energía solar?", "video de un perro")
+_MEDIO = r"(?:audios?|v[ií]deos?|grabaci[oó]n(?:es)?|sonidos?)"
+_PIDE_MEDIO = re.compile(
+    # buscar: "¿hay un audio de…?", "muéstrame el video donde…", "busca una grabación sobre…"
+    rf"\b(?:hay|existe|existen|busca\w*|encuentra\w*|mu[eé]stra\w*|ens[eé][ñn]a\w*|d[oó]nde|tienes|tiene|tienen)\b.{{0,30}}\b{_MEDIO}\b"
+    # o "un audio donde / en el que / que hable de…"
+    rf"|\b{_MEDIO}\s+(?:donde|en\s+(?:el|la|los|las)\s+que|que\s+(?:hable|hablen|trate|mencione|diga|muestre|suene|contenga))\b", re.I)
+
+
+# Preguntas sobre QUÉ MUESTRA una imagen: "¿qué hay en la imagen de la página 3?", "describe la figura 2"
+_FIGURA = r"(?:im[aá]gen(?:es)?|fotos?|fotograf[ií]as?|figuras?|ilustraci[oó]n(?:es)?|gr[aá]ficos?|diagramas?)"
+_PIDE_DESCRIPCION = re.compile(
+    rf"\b(?:qu[eé]|cu[aá]l(?:es)?)\s+(?:se\s+)?(?:muestra\w*|hay|aparece\w*|ve|representa\w*|significa\w*|contiene\w*|dice\w*|son)\b.{{0,40}}\b{_FIGURA}\b"
+    rf"|\b(?:describ\w+|explic\w+|anali[cz]\w+|interpret\w+)\b.{{0,40}}\b{_FIGURA}\b"
+    rf"|\bde\s+qu[eé]\s+(?:trata|habla|va)\b.{{0,30}}\b{_FIGURA}\b", re.I)
+
+
+def pide_descripcion_de_imagen(pregunta: str) -> bool:
+    return bool(_PIDE_DESCRIPCION.search(pregunta))
+
+
+def pagina_pedida(pregunta: str) -> int | None:
+    m = re.search(r"p[aá]g(?:ina)?\.?\s*(\d+)", pregunta, re.I)
+    return int(m.group(1)) if m else None
+
+
+def pide_audio_o_video(pregunta: str) -> bool:
+    return bool(_PIDE_MEDIO.search(pregunta))
+
+
 def es_pregunta_de_imagenes(pregunta: str) -> bool:
-    return bool(_PIDE_CONTEO.search(pregunta) or _PIDE_CONTENIDO.search(pregunta))
+    return bool(_PIDE_CONTEO.search(pregunta) or _PIDE_CONTENIDO.search(pregunta) or _PIDE_MEDIO.search(pregunta)
+                or _PIDE_DESCRIPCION.search(pregunta))
 
 
 def pide_contenido_de_imagen(pregunta: str) -> bool:
-    return bool(_PIDE_CONTENIDO.search(pregunta))
+    return bool(_PIDE_CONTENIDO.search(pregunta) or _PIDE_MEDIO.search(pregunta))

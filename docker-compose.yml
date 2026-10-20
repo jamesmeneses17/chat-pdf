@@ -1,4 +1,4 @@
-# Solo la base de datos PostgreSQL con la extensión pgvector
+# PostgreSQL con pgvector + Adminer (una página web para ver la base de datos: http://localhost:8080)
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -11,6 +11,17 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+
+  adminer:
+    image: adminer
+    container_name: chatpdf_adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
 
 volumes:
   pgdata:
