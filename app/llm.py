@@ -6,7 +6,9 @@ import json
 
 import httpx
 
-from app import config, db, gemini, llamacpp
+import time
+
+from app import clientes, config, db, gemini, llamacpp
 
 # ollama = modelo local con Ollama · llamacpp = el mismo modelo local con llama.cpp · gemini = nube (API)
 PROVEEDORES_CHAT = ("ollama", "llamacpp", "gemini")
@@ -54,7 +56,7 @@ def _cuerpo_ollama(prompt: str, stream: bool) -> dict:
 
 def _respuesta_ollama(prompt: str) -> str:
     try:
-        r = httpx.post(
+        r = clientes.LOCAL.post(
             f"{config.OLLAMA_URL}/api/chat",
             json=_cuerpo_ollama(prompt, stream=False),
             timeout=120,  # PC lenta: damos tiempo de sobra
@@ -70,7 +72,7 @@ def _respuesta_ollama(prompt: str) -> str:
 def _respuesta_ollama_stream(prompt: str):
     """Va entregando la respuesta por pedazos a medida que Ollama la genera."""
     try:
-        with httpx.stream(
+        with clientes.LOCAL.stream(
             "POST",
             f"{config.OLLAMA_URL}/api/chat",
             json=_cuerpo_ollama(prompt, stream=True),
@@ -97,8 +99,19 @@ def nombre_modelo_chat() -> str:
     return config.CHAT_MODEL if config.AI_MODE == "ollama" else "simulado (modo prueba)"
 
 
+_memoria_modelos = (0.0, None)
+
+
 def info_modelos() -> dict:
-    """Qué modelos usa el sistema ahora y si Ollama los tiene instalados."""
+    """Qué modelos usa el sistema ahora y si Ollama los tiene instalados (se recuerda 15 s: se pide en cada pantalla)."""
+    global _memoria_modelos
+    if _memoria_modelos[1] is None or time.time() - _memoria_modelos[0] > 15 \
+            or _memoria_modelos[1].get("chat") != nombre_modelo_chat():
+        _memoria_modelos = (time.time(), _info_modelos())
+    return _memoria_modelos[1]
+
+
+def _info_modelos() -> dict:
     if config.AI_MODE != "ollama":
         return {
             "chat": "simulado (modo prueba)",
@@ -107,7 +120,7 @@ def info_modelos() -> dict:
             "faltan": [],
         }
     try:
-        r = httpx.get(f"{config.OLLAMA_URL}/api/tags", timeout=3)
+        r = clientes.LOCAL.get(f"{config.OLLAMA_URL}/api/tags", timeout=3)
         r.raise_for_status()
         instalados = {m["name"] for m in r.json()["models"]}
         activo = True

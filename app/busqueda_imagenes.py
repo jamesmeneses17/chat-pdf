@@ -83,7 +83,7 @@ def indexar(usuario: str, nombre: str, contenido_pdf: bytes) -> dict:
                 error = str(e)
                 break
             filas += nuevas
-            adjuntos.append(adjunto)
+            adjuntos.append(medios.version_reproducible(adjunto))
             resultado["audios" if adjunto["tipo"] == "audio" else "videos"] += 1
     db.guardar_imagenes(usuario, nombre, filas, adjuntos)
     return {**resultado, "error": error}
@@ -131,7 +131,7 @@ def indexar_archivo_suelto(usuario: str, nombre: str, datos: bytes) -> dict:
     filas = _segmentos_indexados(adjunto, transcripciones)
     if not filas:
         raise ValueError("No se pudo leer ningún sonido o imagen de ese archivo.")
-    db.guardar_imagenes(usuario, nombre, filas, [adjunto])
+    db.guardar_imagenes(usuario, nombre, filas, [medios.version_reproducible(adjunto)])
     # El texto de lo que se dice entra como fragmentos: así se puede conversar, resumir, citar con el minuto...
     texto = ingerir_transcripcion(usuario, nombre, transcripciones)
     return {"tipo": tipo, "segmentos": len(filas), "fragmentos": texto["fragmentos"],

@@ -14,6 +14,7 @@ from typing import Annotated
 from urllib.parse import quote, unquote
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -49,11 +50,16 @@ app = FastAPI(title="Base de Conocimiento IA", lifespan=lifespan)
 log = logging.getLogger("uvicorn.error")  # así los mensajes salen en la consola de uvicorn
 
 
+_usuarios_registrados: set[str] = set()
+
+
 def usuario_actual(x_usuario: str | None = Header(default=None)) -> str:
     """Nombre del usuario de la petición (limpio); si no viene, 'invitado'."""
     nombre = re.sub(r"[^\w .\-]", "", unquote(x_usuario or "")).strip()[:40]
     nombre = nombre or db.USUARIO_POR_DEFECTO
-    db.asegurar_usuario(nombre)
+    if nombre not in _usuarios_registrados:  # solo la primera vez que aparece (evita una escritura por petición)
+        db.asegurar_usuario(nombre)
+        _usuarios_registrados.add(nombre)
     return nombre
 
 
@@ -87,10 +93,18 @@ def donde_esta(f: dict) -> str:
     return f"minuto {minutos(f['inicio'])}" if f.get("inicio") is not None else f"página {f['pagina']}"
 
 
+def etiqueta_fuente(f: dict) -> str:
+    """De qué tipo de archivo viene un fragmento y dónde: «documento X, página 3» / «audio X, minuto 0:30»."""
+    tipo = f.get("tipo", "pdf")
+    if tipo == "pdf":
+        return f"documento «{f['documento']}», {donde_esta(f)}"
+    return f"{tipo} «{f['documento']}», {donde_esta(f)}"
+
+
 def construir_prompt(pregunta: str, fragmentos: list[dict], historial: list[dict] | None = None) -> str:
     """Arma el prompt: instrucciones + historial + contexto numerado + pregunta."""
     contexto = "\n\n".join(
-        f"[{f['n']}] ({f['documento']}, {donde_esta(f)})\n{f['contenido']}" for f in fragmentos
+        f"[{f['n']}] ({etiqueta_fuente(f)})\n{f['contenido']}" for f in fragmentos
     )
     bloque_historial = ""
     if historial:
@@ -104,6 +118,9 @@ def construir_prompt(pregunta: str, fragmentos: list[dict], historial: list[dict
         '"No encontré esa información en los documentos".\n'
         "- Cuando uses información de un fragmento, cita su número entre corchetes al final de "
         "la frase, por ejemplo [1] o [2].\n"
+        "- Cada fragmento dice entre paréntesis si viene de un documento, un audio o un video (estos "
+        "dos últimos están transcritos). Si mencionas de dónde sale algo, di «según el documento», "
+        "«según el audio» o «según el video», según corresponda; nunca llames documento a un audio o video.\n"
         "- NO uses como dato los números de las preguntas, de las páginas ni de las casillas "
         "(por ejemplo, '32.' al inicio de una pregunta no es una edad).\n"
         "- Los formularios escaneados traen un bloque 'RESPUESTAS MARCADAS EN LA PÁGINA N' con las "
@@ -118,8 +135,8 @@ def construir_prompt(pregunta: str, fragmentos: list[dict], historial: list[dict
         "estén marcadas o no.\n"
         "- Si piden un dato de la persona y no hay ninguna opción marcada de ese tema, responde "
         'exactamente: "No encontré esa información en los documentos".\n'
-        "- El contexto viene de PDFs y puede tener errores o símbolos sueltos de escaneo: "
-        "ignóralos.\n"
+        "- El contexto viene de PDFs o de la transcripción de audios y videos, y puede tener errores o "
+        "símbolos sueltos: ignóralos.\n"
         "- Sé breve y directo: responde en pocas líneas.\n\n"
         f"{bloque_historial}"
         f"CONTEXTO:\n{contexto}\n\n"
@@ -140,8 +157,10 @@ def preparar_consulta(datos: PreguntaChat, usuario: str, tiempos: dict):
         tiempos["reformular_ms"] = round((time.perf_counter() - t) * 1000)
 
     fragmentos = buscar_similares(interpretada, usuario, datos.documentos, tiempos)
+    tipos = db.tipos_de_documentos(usuario)  # audio / video; lo demás son PDFs
     for i, f in enumerate(fragmentos, 1):
         f["n"] = i  # número con el que el modelo cita cada fragmento
+        f["tipo"] = tipos.get(f["documento"], "pdf")
     prompt = construir_prompt(interpretada, fragmentos, historial) if fragmentos else ""
     return interpretada, fragmentos, prompt
 
@@ -169,7 +188,7 @@ def respuesta_viendo_imagenes(datos: PreguntaChat, usuario: str, nombres: list[s
             pass
     if not imagenes:
         return ("No tengo imágenes indexadas" + (f" en la página {pagina}" if pagina else "") +
-                " de los documentos elegidos. Usa el botón «🖼️ Indexar imágenes, audio y video» bajo el visor.", [], [])
+                " de los documentos elegidos. Usa el botón «Indexar imágenes, audio y video» bajo el visor.", [], [])
     if not gemini.disponible():
         return ("Para decir qué muestra una imagen hace falta un modelo con visión, y no hay ninguna clave de "
                 "Gemini disponible. " + gemini.mensaje_sin_claves(), [], [])
@@ -193,7 +212,7 @@ def respuesta_viendo_imagenes(datos: PreguntaChat, usuario: str, nombres: list[s
              "Se enviaron a Google para poder verlas.*")
     avisos = gemini.pop_avisos()
     if avisos:
-        texto += "\n\n⚠️ " + " ".join(avisos)
+        texto += "\n\nAviso: " + " ".join(avisos)
     detalle = [{"n": n, "documento": i["documento"], "pagina": i["pagina"], "pasajes": [],
                 "titulo": "Imagen analizada"} for n, i in enumerate(imagenes, 1)]
     mostradas = [{"id": i["id"], "documento": i["documento"], "pagina": i["pagina"], "similitud": 1.0,
@@ -244,7 +263,7 @@ def respuesta_sobre_imagenes(datos: PreguntaChat, usuario: str) -> tuple[str, li
         if candidatas is not None:
             if not candidatas:
                 texto += (f"\n\nNo hay {que} indexados para buscar. Sube el archivo de nuevo o usa el botón "
-                          "«🖼️ Indexar imágenes, audio y video» bajo el visor.")
+                          "«Indexar imágenes, audio y video» bajo el visor.")
             elif not encontradas:
                 mejor = candidatas[0]
                 donde = f"pág. {mejor['pagina']} de {mejor['documento']}" if mejor["pagina"] else mejor["documento"]
@@ -262,7 +281,7 @@ def respuesta_sobre_imagenes(datos: PreguntaChat, usuario: str) -> tuple[str, li
                            for i, e in enumerate(encontradas) if e["tipo"] == "imagen" and e["pagina"]]
     avisos = gemini.pop_avisos()  # si hubo que cambiar de clave o una llegó a su límite
     if avisos:
-        texto += "\n\n⚠️ " + " ".join(avisos)
+        texto += "\n\nAviso: " + " ".join(avisos)
     return texto, detalle, encontradas
 
 
@@ -290,6 +309,7 @@ def detalle_de_citas(respuesta: str, pregunta: str, fragmentos: list[dict],
                      citas: list[int]) -> list[dict]:
     """Por cada fragmento citado: documento, página y los pasajes exactos que hay que resaltar."""
     return [{"n": f["n"], "documento": f["documento"], "pagina": f["pagina"], "inicio": f.get("inicio"),
+             "tipo": f.get("tipo", "pdf"),
              "pasajes": pasajes_de_respuesta(respuesta, pregunta, f["contenido"])}
             for f in fragmentos if f["n"] in citas]
 
@@ -298,7 +318,7 @@ def lista_de_fuentes(fragmentos: list[dict]) -> list[dict]:
     """Fuentes para mostrar: número, documento, página, texto completo y por qué se eligió."""
     return [{
         "n": f["n"], "documento": f["documento"], "pagina": f["pagina"], "inicio": f.get("inicio"),
-        "fragmento": f["contenido"],  # el texto completo del fragmento
+        "tipo": f.get("tipo", "pdf"), "fragmento": f["contenido"],  # el texto completo del fragmento
         "id": f.get("id"), "posicion": f.get("posicion"), "total_documento": f.get("total_documento"),
         "similitud": round(f.get("similitud", 0), 3),  # parecido por significado (vectores)
         "coincidencia": round(f.get("coincidencia", 0), 3),  # palabras de la pregunta que contiene
@@ -310,7 +330,9 @@ def lista_de_fuentes(fragmentos: list[dict]) -> list[dict]:
 @app.post("/subir")
 async def subir(usuario: Usuario, archivo: UploadFile = File(...)):
     contenido = await archivo.read()
-    return procesar_subida(usuario, archivo.filename, contenido)
+    # El trabajo pesado (leer, OCR, embeddings, transcribir...) va en un hilo: si corriera aquí, bloquearía TODA la
+    # API mientras dure y no se podría abrir ni una conversación
+    return await run_in_threadpool(procesar_subida, usuario, archivo.filename, contenido)
 
 
 def procesar_subida(usuario: str, nombre: str, contenido: bytes) -> dict:
@@ -561,7 +583,7 @@ def modelo_de_chat():
     return {"proveedor": llm.proveedor_chat(), "opciones": list(llm.PROVEEDORES_CHAT),
             "gemini_disponible": gemini.disponible(), "modelo_nube": config.GEMINI_CHAT_MODEL,
             "modelo_local": config.CHAT_MODEL, "llamacpp_listo": llamacpp.ruta_servidor().is_file()
-            and llamacpp.ruta_modelo() is not None, "llamacpp_activo": llamacpp.servidor_activo()}
+            and llamacpp.ruta_modelo() is not None, "llamacpp_activo": llamacpp.servidor_activo_rapido()}
 
 
 @app.post("/chat/modelo")
@@ -663,8 +685,9 @@ def crear_resumen_stream(nombre: str, usuario: Usuario):
             cobertura["cifras_sin_respaldo"] = cifras_sin_respaldo(resumen, texto_leido)
             textos = cobertura.pop("textos")
             # Por cada página leída, los pasajes que respaldan lo escrito (para pintarlos de amarillo en el PDF)
+            inicios = db.inicios_por_pagina(usuario, nombre)  # si es un audio / video: minuto de cada fragmento
             detalle = [{"n": i, "documento": nombre, "pagina": pagina, "titulo": "Fuente del resumen",
-                        "pasajes": pasajes_de_respuesta(resumen, "", texto)}
+                        "inicio": inicios.get(pagina), "pasajes": pasajes_de_respuesta(resumen, "", texto)}
                        for i, (pagina, texto) in enumerate(sorted(textos.items()), 1)]
             cobertura["detalle"] = [d for d in detalle if d["pasajes"]]
             yield json.dumps({"cobertura": cobertura}) + "\n"
@@ -787,7 +810,7 @@ async def leer_imagen(usuario: Usuario, archivo: UploadFile = File(...)):
     if len(contenido) > MAX_BYTES_IMAGEN:
         raise HTTPException(status_code=413, detail="La imagen pesa más de 10 MB.")
     try:
-        texto = leer_texto_de_imagen(contenido, archivo.filename or "imagen.png")
+        texto = await run_in_threadpool(leer_texto_de_imagen, contenido, archivo.filename or "imagen.png")
     except Exception:
         raise HTTPException(status_code=400, detail="No se pudo abrir la imagen. Usa PNG o JPG.")
     return {"texto": texto}

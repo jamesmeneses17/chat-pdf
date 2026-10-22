@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 
-from app import config
+from app import clientes, config
 
 RAIZ = Path(__file__).resolve().parent.parent
 _candado = threading.Lock()
@@ -50,9 +50,20 @@ def ruta_modelo() -> Path | None:
 
 def servidor_activo() -> bool:
     try:
-        return httpx.get(f"{_url()}/health", timeout=2).status_code == 200
+        return clientes.LOCAL.get(f"{_url()}/health", timeout=0.5).status_code == 200
     except httpx.HTTPError:
         return False
+
+
+_ultimo_estado = (0.0, False)
+
+
+def servidor_activo_rapido() -> bool:
+    """Como servidor_activo(), pero recuerda la respuesta 10 s (para mostrar el estado sin demorar cada pantalla)."""
+    global _ultimo_estado
+    if time.time() - _ultimo_estado[0] > 10:
+        _ultimo_estado = (time.time(), servidor_activo())
+    return _ultimo_estado[1]
 
 
 def iniciar(espera: int = 120):
@@ -101,7 +112,7 @@ def _cuerpo(prompt: str, stream: bool) -> dict:
 def generar(prompt: str) -> str:
     iniciar()
     try:
-        r = httpx.post(f"{_url()}/v1/chat/completions", json=_cuerpo(prompt, False), timeout=300)
+        r = clientes.LOCAL.post(f"{_url()}/v1/chat/completions", json=_cuerpo(prompt, False), timeout=300)
         r.raise_for_status()
     except httpx.HTTPError as e:
         raise RuntimeError(f"llama.cpp devolvió un error: {e}") from e
@@ -112,7 +123,7 @@ def generar_stream(prompt: str):
     """Entrega la respuesta por pedazos a medida que llama.cpp la escribe."""
     iniciar()
     try:
-        with httpx.stream("POST", f"{_url()}/v1/chat/completions", json=_cuerpo(prompt, True), timeout=300) as r:
+        with clientes.LOCAL.stream("POST", f"{_url()}/v1/chat/completions", json=_cuerpo(prompt, True), timeout=300) as r:
             r.raise_for_status()
             for linea in r.iter_lines():
                 if not linea.startswith("data:") or linea.strip() == "data: [DONE]":

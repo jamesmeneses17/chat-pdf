@@ -63,6 +63,43 @@ Abre http://localhost:8501. La API crea las tablas sola al iniciar.
 - **Imágenes del PDF:** «¿cuántas imágenes trae el PDF?» se contesta leyendo el archivo (sin IA),
   con las páginas que las tienen y las páginas que son un escaneo completo. Qué muestra una imagen
   (un perro, una planta...) **todavía no se puede saber**: haría falta un modelo de visión.
+- **Interfaz (estilo ChatPDF):** pantalla de inicio con una tarjeta para soltar archivos (PDF, audio o
+  video), barra lateral con «Nuevo chat», lista de chats, documentos y un panel de «Ajustes» (usuario,
+  claves de Gemini y elección de modelos), documento a la izquierda y chat con burbujas a la derecha, y
+  preguntas sugeridas como botones. Sigue siendo Streamlit: los colores y la tipografía están en
+  `.streamlit/config.toml` y el resto del estilo en `estilo.css` (se puede editar sin tocar el código).
+  Se revisó con capturas reales en un navegador (Playwright) en cada pantalla.
+- **Se puede seguir trabajando mientras algo se procesa:** las preguntas, las subidas de archivos, los
+  resúmenes, los puntos clave, los glosarios y la indexación de la carpeta o de las imágenes corren en un
+  hilo propio (`app/segundo_plano.py`) y guardan su resultado en la base de datos. Antes, al tocar cualquier
+  cosa, Streamlit volvía a ejecutar la pantalla y cortaba la respuesta o la subida en curso. Ahora se puede
+  abrir otro chat, marcar archivos o hacer otra pregunta en otro chat: el avance se ve en «Respondiendo…» /
+  «Subiendo…» (barra lateral) y, al terminar, aparece «Respuesta lista» con el botón «Abrir chat». Si sigues en
+  el mismo chat, la respuesta aparece sola. Mientras se responde en un chat, su cuadro de preguntas queda
+  deshabilitado (en otro chat sí se puede preguntar). Límite: las tareas viven en la memoria del servidor; si
+  se apaga `streamlit`, se pierden las que no habían terminado (lo ya guardado queda).
+- **Pantalla de inicio sin archivos elegidos:** al entrar no hay ningún archivo marcado ni visor: se ve
+  la pantalla de inicio (subir un archivo, abrir un chat anterior o elegir uno de «Tus archivos»). El visor y
+  el chat aparecen al subir un archivo, elegirlo o abrir una conversación; «Nuevo chat» vuelve al inicio.
+  En la lista de chats cada conversación muestra el archivo del que trata y, debajo, su primera pregunta.
+  Para audios y videos todo habla de «audio» o «video» (no de «documento»): las fuentes dicen «audio X, minuto
+  0:30», el resumen se hace sobre la transcripción y el modelo recibe el tipo de cada fuente.
+- **Documentos de cada conversación:** cada respuesta guarda qué documentos estaban marcados cuando se
+  preguntó. Al abrir un chat viejo se vuelven a marcar solo esos (y el visor muestra solo esos); en chats
+  anteriores a este cambio se deducen de las fuentes citadas. Un chat nuevo conserva la selección actual.
+  La interfaz usa pocos íconos: texto sencillo y solo íconos funcionales del sistema (borrar, girar, cerrar).
+- **Historial de conversaciones (rápido):** cada chat se guarda en PostgreSQL (tablas `conversaciones` y
+  `mensajes`) y aparece en «Chats». Abrir uno solo lee lo guardado: **no usa ningún modelo de IA**. Se
+  midió que tardaba ~9 s por culpa de la propia aplicación (cada pantalla hacía 12 consultas a la API y cada
+  una creaba un cliente HTTP nuevo, ~0,4 s); ahora se reutiliza un solo cliente, el estado de Ollama /
+  llama.cpp se recuerda unos segundos y las consultas que casi no cambian se guardan en la sesión: abrir un
+  chat tarda ~0,6 s. Si algo cambia (subir un archivo, cambiar de modelo...) esa memoria se borra sola.
+- **Responsivo (computador, tableta y celular):** en pantallas de hasta 1000 px el documento y el chat se
+  apilan (uno debajo del otro); en celular el título se compacta, la barra lateral se abre con el botón «»»
+  de arriba a la izquierda, las burbujas del chat usan todo el ancho y las cajas con scroll miden un
+  porcentaje de la pantalla (en computador se ajustan para que la barra de escribir quede siempre
+  visible). Revisado con capturas a 390 px (celular), 820 px (tableta) y 1440 px (computador) y sin
+  desplazamiento horizontal. Para abrir la app ya con un usuario: `http://localhost:8501/?usuario=Maria`.
 - **Conversar con audios y videos (Whisper local):** al subir un audio o un video suelto (o ponerlo en la
   carpeta `conocimiento/`), además de sus vectores con EmbeddingGemma 2 se **transcribe lo que se dice**
   con Whisper (`openai/whisper-base`, ~0,7 s de cálculo por segundo de audio en un Core i5 de 8.ª gen; con

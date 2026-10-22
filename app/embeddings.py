@@ -9,7 +9,7 @@ import unicodedata
 
 import httpx
 
-from app import config, db, gemini, gemma2
+from app import clientes, config, db, gemini, gemma2
 
 MENSAJE_SIN_OLLAMA = "No se pudo conectar con Ollama. ¿Está instalado y corriendo?"
 
@@ -40,7 +40,7 @@ def _embedding_mock(texto: str) -> list[float]:
 def _embeddings_ollama(textos: list[str], modelo: str | None = None) -> list[list[float]]:
     """Ollama acepta varios textos en una sola llamada (más rápido que uno por uno)."""
     try:
-        r = httpx.post(
+        r = clientes.LOCAL.post(
             f"{config.OLLAMA_URL}/api/embed",
             json={"model": modelo or config.EMBED_MODEL, "input": textos,
                   "keep_alive": config.KEEP_ALIVE},

@@ -16,6 +16,16 @@ def _recortar(texto: str, limite: int) -> str:
     return texto[:limite].rsplit(" ", 1)[0] + "…"
 
 
+def _tipo(usuario: str, nombre: str) -> str:
+    """'pdf', 'audio' o 'video'."""
+    return db.tipos_de_documentos(usuario).get(nombre, "pdf")
+
+
+def _adaptar(prompt: str, tipo: str) -> str:
+    """En un audio o video, el texto dice «el audio» / «el video» en vez de «el documento»."""
+    return prompt if tipo == "pdf" else prompt.replace("documento", tipo)
+
+
 def muestra_del_documento(usuario: str, nombre: str) -> tuple[str, dict]:
     """Un fragmento por página, juntos en orden. Devuelve (texto, cobertura).
 
@@ -42,7 +52,14 @@ def muestra_del_documento(usuario: str, nombre: str) -> tuple[str, dict]:
     if len(paginas) > maximo:  # documento muy largo: páginas repartidas
         elegidas = [paginas[int(i * len(paginas) / maximo)] for i in range(maximo)]
     presupuesto = config.RESUMEN_CHARS // len(elegidas)
-    partes = [f"[Página {p}] {_recortar(mejor_de_pagina[p], presupuesto)}" for p in elegidas]
+    inicios = db.inicios_por_pagina(usuario, nombre)  # audio / video: cada «página» es un tramo con su minuto
+
+    def etiqueta(p: int) -> str:
+        if p in inicios:
+            return f"[Minuto {int(inicios[p]) // 60}:{int(inicios[p]) % 60:02d}]"
+        return f"[Página {p}]"
+
+    partes = [f"{etiqueta(p)} {_recortar(mejor_de_pagina[p], presupuesto)}" for p in elegidas]
 
     texto_total = sum(len(c) for _, c in del_texto)
     texto_usado = sum(len(_recortar(mejor_de_pagina[p], presupuesto)) for p in elegidas)
@@ -52,6 +69,7 @@ def muestra_del_documento(usuario: str, nombre: str) -> tuple[str, dict]:
         "paginas_usadas": elegidas,
         "paginas_total": len(paginas),
         "porcentaje": round(100 * texto_usado / max(1, texto_total)),
+        "tipo": _tipo(usuario, nombre),
         # el texto exacto que el modelo leyó de cada página (para ubicar de dónde salió lo que escribió)
         "textos": {p: _recortar(mejor_de_pagina[p], presupuesto) for p in elegidas},
     }
@@ -64,7 +82,7 @@ def cifras_sin_respaldo(resumen: str, texto_leido: str) -> list[str]:
     Los modelos pequeños a veces inventan números ("20 preguntas"). No se puede corregir, pero sí avisar.
     """
     def cifras(texto: str) -> set[str]:
-        sin_etiquetas = re.sub(r"\[Página \d+\]", " ", texto)  # los números de página no cuentan
+        sin_etiquetas = re.sub(r"\[(?:Página \d+|Minuto \d+:\d+)\]", " ", texto)  # los números de página no cuentan
         return {c.strip(".,") for c in re.findall(r"\d[\d.,]*", sin_etiquetas)}
     return sorted(cifras(resumen) - cifras(texto_leido), key=lambda c: (len(c), c))
 
@@ -76,6 +94,21 @@ def _texto_del_documento(usuario: str, nombre: str) -> str:
 
 def _armar_prompt(usuario: str, nombre: str) -> str:
     texto = _texto_del_documento(usuario, nombre)
+    tipo = _tipo(usuario, nombre)
+    if tipo != "pdf":  # audio o video: se resume lo que se dice (la transcripción)
+        return (
+            f"Resume en español el {tipo}, usando SOLO la transcripción dada (lo que se dice en él).\n"
+            "Escribe ÚNICAMENTE un párrafo de máximo 100 palabras, sin títulos, sin viñetas y "
+            "sin repetir estas instrucciones.\n"
+            f"- Empieza diciendo de qué trata el {tipo}.\n"
+            "- Menciona los temas principales en el orden en que aparecen.\n"
+            "- NO inventes cifras, nombres ni datos que no estén en la transcripción.\n"
+            "- La transcripción puede tener errores de reconocimiento de voz: ignóralos.\n"
+            "- El contexto reúne un fragmento de cada tramo (marcados [Minuto m:ss]): "
+            f"resume todo el {tipo}, no solo el inicio.\n\n"
+            f"CONTEXTO:\n{texto}\n\n"
+            f"PREGUNTA: Resume el {tipo}."
+        )
     return (
         "Resume en español el documento, usando SOLO el texto dado.\n"
         "Escribe ÚNICAMENTE un párrafo de máximo 100 palabras, sin títulos, sin viñetas y "
@@ -153,6 +186,7 @@ def _es_copia_del_texto(pregunta: str, grupos_texto: set[tuple]) -> bool:
 
 def generar_preguntas(usuario: str, nombre: str) -> list[str]:
     """Devuelve 3 preguntas que se pueden hacer sobre el documento."""
+    tipo = _tipo(usuario, nombre)
     texto = _texto_del_documento(usuario, nombre)
     prompt = (
         "A partir del texto, escribe EXACTAMENTE 5 preguntas distintas que una persona "
@@ -170,9 +204,9 @@ def generar_preguntas(usuario: str, nombre: str) -> list[str]:
     )
     # Se piden 5 y se descartan las que copian frases del documento; se usan las 3 primeras
     grupos_texto = _grupos_de_palabras(texto)
-    candidatas = _limpiar_preguntas(generar_respuesta(prompt))
+    candidatas = _limpiar_preguntas(generar_respuesta(_adaptar(prompt, tipo)))
     preguntas = [p for p in candidatas if not _es_copia_del_texto(p, grupos_texto)][:3]
-    for generica in PREGUNTAS_GENERICAS:  # completar si faltaron
+    for generica in [_adaptar(g, tipo) for g in PREGUNTAS_GENERICAS]:  # completar si faltaron
         if len(preguntas) >= 3:
             break
         if generica not in preguntas:
@@ -193,6 +227,7 @@ def _lineas_con_vinetas(texto: str, maximo: int) -> list[str]:
 
 def generar_puntos_clave(usuario: str, nombre: str) -> str:
     """Genera de 5 a 7 puntos clave del documento, los guarda y los devuelve en texto."""
+    tipo = _tipo(usuario, nombre)
     texto = _texto_del_documento(usuario, nombre)
     prompt = (
         "Escribe en español de 5 a 7 PUNTOS CLAVE del documento, usando SOLO el texto dado.\n"
@@ -204,7 +239,7 @@ def generar_puntos_clave(usuario: str, nombre: str) -> str:
         f"CONTEXTO:\n{texto}\n\n"
         "PREGUNTA: Escribe los puntos clave."
     )
-    puntos = _lineas_con_vinetas(generar_respuesta(prompt), 7)
+    puntos = _lineas_con_vinetas(generar_respuesta(_adaptar(prompt, tipo)), 7)
     if not puntos:
         raise RuntimeError("El modelo no devolvió puntos clave. Inténtalo de nuevo.")
     resultado = "\n".join(f"- {p}" for p in puntos)
@@ -226,6 +261,7 @@ def _sin_tildes(texto: str) -> str:
 
 def generar_glosario(usuario: str, nombre: str) -> str:
     """Genera un glosario de 5 a 8 términos del documento, lo guarda y lo devuelve en texto."""
+    tipo = _tipo(usuario, nombre)
     texto = _texto_del_documento(usuario, nombre)
     prompt = (
         "Escribe en español un GLOSARIO de 5 a 8 términos importantes que aparezcan en el texto "
@@ -243,7 +279,7 @@ def generar_glosario(usuario: str, nombre: str) -> str:
         "PREGUNTA: Escribe el glosario."
     )
     entradas = []
-    for linea in _lineas_con_vinetas(generar_respuesta(prompt), 10):
+    for linea in _lineas_con_vinetas(generar_respuesta(_adaptar(prompt, tipo)), 10):
         termino, _, definicion = linea.partition(":")
         termino, definicion = termino.strip("*_ \"“”"), definicion.strip()
         # El modelo pequeño a veces ignora la regla de las palabras comunes: se filtran aquí

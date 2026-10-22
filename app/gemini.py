@@ -16,7 +16,7 @@ from datetime import datetime
 import httpx
 import numpy as np
 
-from app import config, db
+from app import clientes, config, db
 
 URL = "https://generativelanguage.googleapis.com/v1beta/models/{modelo}:embedContent"
 PAUSA_LIMITE = 65  # segundos que descansa una clave que llegó a su límite por minuto
@@ -156,7 +156,7 @@ def _pedir(metodo: str, cuerpo: dict, modelo: str | None = None) -> dict:
         cabeceras = {"x-goog-api-key": clave, "Content-Type": "application/json"}
         for intento in range(3):
             try:
-                respuesta = httpx.post(url, headers=cabeceras, json=cuerpo, timeout=120)
+                respuesta = clientes.NUBE.post(url, headers=cabeceras, json=cuerpo, timeout=120)
             except httpx.HTTPError:
                 raise RuntimeError("No se pudo conectar con Gemini. ¿Hay conexión a internet?") from None
             # Con una sola clave disponible se espera un poco (límite por minuto); con otra de respaldo, se cambia

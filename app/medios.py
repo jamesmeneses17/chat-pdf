@@ -11,18 +11,24 @@ import io
 import os
 import tempfile
 import wave
+from fractions import Fraction
 
 import numpy as np
 import pymupdf
 
 from app import config
 
-EXT_AUDIO = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".wma", ".opus"}
-EXT_VIDEO = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}
+EXT_AUDIO = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".wma", ".opus", ".mp2", ".mpga", ".aiff", ".aif", ".amr"}
+EXT_VIDEO = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".mpeg", ".mpg", ".wmv", ".flv", ".3gp", ".ogv"}
 MIMES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".flac": "audio/flac",
-         ".aac": "audio/aac", ".wma": "audio/x-ms-wma", ".opus": "audio/ogg", ".mp4": "video/mp4",
-         ".webm": "video/webm", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
-         ".m4v": "video/mp4"}
+         ".aac": "audio/aac", ".wma": "audio/x-ms-wma", ".opus": "audio/ogg", ".mp2": "audio/mpeg",
+         ".mpga": "audio/mpeg", ".aiff": "audio/aiff", ".aif": "audio/aiff", ".amr": "audio/amr",
+         ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+         ".avi": "video/x-msvideo", ".m4v": "video/mp4", ".mpeg": "video/mpeg", ".mpg": "video/mpeg",
+         ".wmv": "video/x-ms-wmv", ".flv": "video/x-flv", ".3gp": "video/3gpp", ".ogv": "video/ogg"}
+# Formatos que el navegador reproduce solo. Los demás (MPEG, AVI, WMV...) se leen igual para indexarlos, pero
+# se guarda además una copia en MP4 / WAV para poder reproducirlos en el visor.
+REPRODUCIBLES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus", ".mp4", ".webm", ".m4v", ".mov", ".ogv"}
 TASA_AUDIO = 16000  # Hz, lo que pide el modelo
 ANCHO_VIDEO = 320  # px: los fotogramas se reducen (el modelo no necesita más y el cálculo es mucho más rápido)
 
@@ -35,6 +41,83 @@ def tipo_de_archivo(nombre: str) -> str | None:
 
 def mime_de(nombre: str) -> str:
     return MIMES.get(os.path.splitext(nombre.lower())[1], "application/octet-stream")
+
+
+def version_reproducible(adjunto: dict) -> dict:
+    """Si el navegador no puede reproducir el formato (p. ej. MPEG), devuelve el adjunto con una copia en MP4 / WAV.
+
+    El nombre no cambia (así se sigue llamando clip.mpeg); solo cambian los bytes guardados y su tipo MIME.
+    Si la conversión falla, se deja el original (se indexa igual, solo que el navegador quizá no lo reproduzca).
+    """
+    if os.path.splitext(adjunto["nombre"].lower())[1] in REPRODUCIBLES:
+        return adjunto
+    try:
+        if adjunto["tipo"] == "video":
+            return {**adjunto, "datos": _video_a_mp4(adjunto["datos"]), "mime": "video/mp4"}
+        return {**adjunto, "datos": _audio_a_wav(adjunto["datos"]), "mime": "audio/wav"}
+    except Exception:
+        return adjunto
+
+
+def _audio_a_wav(datos: bytes) -> bytes:
+    """Todo el audio en un WAV (16 kHz, mono) que cualquier navegador reproduce."""
+    import av
+    muestras = []
+    with av.open(io.BytesIO(datos)) as contenedor:
+        flujo = next(f for f in contenedor.streams if f.type == "audio")
+        remuestreo = av.AudioResampler(format="s16", layout="mono", rate=TASA_AUDIO)
+        for trama in contenedor.decode(flujo):
+            for r in remuestreo.resample(trama):
+                muestras.append(r.to_ndarray().reshape(-1))
+        for r in remuestreo.resample(None) or []:
+            muestras.append(r.to_ndarray().reshape(-1))
+    salida = io.BytesIO()
+    with wave.open(salida, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TASA_AUDIO)
+        w.writeframes(np.concatenate(muestras).astype(np.int16).tobytes())
+    return salida.getvalue()
+
+
+def _video_a_mp4(datos: bytes, ancho_max: int = 640) -> bytes:
+    """Convierte un video (MPEG, AVI, WMV...) a MP4 con H.264 + AAC, que todos los navegadores reproducen."""
+    import av
+    destino = io.BytesIO()
+    with av.open(io.BytesIO(datos)) as entrada, av.open(destino, "w", format="mp4") as salida:
+        v_in = next(f for f in entrada.streams if f.type == "video")
+        a_in = next((f for f in entrada.streams if f.type == "audio"), None)
+        ancho = min(v_in.codec_context.width, ancho_max)
+        ancho -= ancho % 2
+        alto = int(v_in.codec_context.height * ancho / v_in.codec_context.width)
+        alto -= alto % 2
+        fps = Fraction(v_in.average_rate or 25)
+        tiempo_por_cuadro = 1 / fps  # tiempo de cada fotograma (el del stream aún no está fijado al empezar)
+        v_out = salida.add_stream("libx264", rate=fps)
+        v_out.width, v_out.height, v_out.pix_fmt = ancho, alto, "yuv420p"
+        v_out.options = {"crf": "28", "preset": "veryfast", "bf": "0"}
+        a_out, remuestreo = None, None
+        if a_in is not None:
+            a_out = salida.add_stream("aac", rate=44100)
+            remuestreo = av.AudioResampler(format="fltp", layout="stereo", rate=44100)
+        n = 0
+        for trama in entrada.decode(*[s for s in (v_in, a_in) if s is not None]):
+            if trama.__class__.__name__ == "VideoFrame":
+                nueva = trama.reformat(width=ancho, height=alto, format="yuv420p")
+                nueva.pts, nueva.time_base = n, tiempo_por_cuadro
+                n += 1
+                for paquete in v_out.encode(nueva):
+                    salida.mux(paquete)
+            elif a_out is not None:
+                for r in remuestreo.resample(trama):
+                    for paquete in a_out.encode(r):
+                        salida.mux(paquete)
+        for paquete in v_out.encode():
+            salida.mux(paquete)
+        if a_out is not None:
+            for paquete in a_out.encode():
+                salida.mux(paquete)
+    return destino.getvalue()
 
 
 def adjuntos_del_pdf(contenido_pdf: bytes) -> list[dict]:

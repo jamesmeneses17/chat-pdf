@@ -370,6 +370,14 @@ def obtener_adjunto(usuario: str, imagen_id: int) -> tuple[str, bytes] | None:
     return (fila[0], bytes(fila[1])) if fila else None
 
 
+def inicios_por_pagina(usuario: str, documento: str) -> dict[int, float]:
+    """{número de fragmento: segundo en que empieza} de un audio o video transcrito (vacío para un PDF)."""
+    with conectar() as conn:
+        return {p: i for p, i in conn.execute(
+            "SELECT pagina, MIN(inicio) FROM chunks WHERE usuario = %s AND documento = %s AND inicio IS NOT NULL "
+            "GROUP BY pagina", (usuario, documento))}
+
+
 def obtener_adjunto_de_documento(usuario: str, documento: str) -> tuple[str, str, bytes] | None:
     """(tipo, tipo MIME, bytes) del audio o video de un documento suelto (el primero que tenga)."""
     with conectar() as conn:
@@ -451,14 +459,41 @@ def crear_conversacion(usuario: str, titulo: str | None = None) -> int:
         ).fetchone()[0]
 
 
+def tipos_de_documentos(usuario: str) -> dict[str, str]:
+    """{nombre: 'audio' | 'video'} de los archivos sueltos del usuario (los PDFs no aparecen: son el caso normal)."""
+    with conectar() as conn:
+        return {d: t for d, t in conn.execute(
+            "SELECT documento, MIN(tipo) FROM adjuntos WHERE usuario = %s AND nombre = documento GROUP BY documento",
+            (usuario,))}
+
+
+def _documentos_del_mensaje(extra: str | None) -> list[str]:
+    """Qué documentos usó una respuesta guardada (los marcados, o los que citó)."""
+    try:
+        datos = json.loads(extra or "{}")
+    except ValueError:
+        return []
+    if datos.get("documentos_usados"):
+        return list(datos["documentos_usados"])
+    return sorted({f["documento"] for f in (datos.get("fuentes") or []) if f.get("documento")})
+
+
 def listar_conversaciones(usuario: str) -> list[dict]:
+    """Conversaciones del usuario, con los documentos que usó cada una (para mostrar de qué archivo trata)."""
     with conectar() as conn:
         filas = conn.execute(
             "SELECT id, titulo, actualizado FROM conversaciones WHERE usuario = %s "
             "ORDER BY actualizado DESC, id DESC",
             (usuario,),
         ).fetchall()
-    return [{"id": i, "titulo": t or "Conversación nueva", "actualizado": a.isoformat()}
+        ultimos = {}
+        if filas:  # la última respuesta de cada conversación dice con qué documentos se hablaba
+            ultimos = {c: e for c, e in conn.execute(
+                "SELECT DISTINCT ON (conversacion_id) conversacion_id, extra FROM mensajes "
+                "WHERE rol = 'assistant' AND conversacion_id = ANY(%s) ORDER BY conversacion_id, id DESC",
+                ([f[0] for f in filas],))}
+    return [{"id": i, "titulo": t or "Conversación nueva", "actualizado": a.isoformat(),
+             "documentos": _documentos_del_mensaje(ultimos.get(i))}
             for i, t, a in filas]
 
 

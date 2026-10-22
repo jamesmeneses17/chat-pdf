@@ -1,0 +1,28 @@
+# Tema visual de «Base de Conocimiento IA» (inspirado en ChatPDF: fondo blanco, acento violeta, tipografía Inter)
+[theme]
+base = "light"
+primaryColor = "#7C3AED"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F5FB"
+textColor = "#1F1B2E"
+borderColor = "#E6E3F0"
+linkColor = "#6D28D9"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+baseRadius = "12px"
+buttonRadius = "10px"
+showWidgetBorder = true
+showSidebarBorder = true
+greenColor = "#16A34A"
+blueColor = "#4F46E5"
+violetColor = "#7C3AED"
+
+[theme.sidebar]
+backgroundColor = "#FAFAFC"
+secondaryBackgroundColor = "#F1EFF8"
+borderColor = "#ECE9F4"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
